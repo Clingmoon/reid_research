@@ -44,5 +44,5 @@ TEST:
 
 DATASETS:
   NAMES: ('msmt17')
-  ROOT_DIR: ('/home/cfdeng/projects/CLIMB-ReID/datasets/reid-datasets')
-OUTPUT_DIR: './logs200'
+  ROOT_DIR: ('/home/cfdeng/projects/CLIMB-ReID/datasets/reid-datasets/MSMT17')
+OUTPUT_DIR: './logsmsmt'
