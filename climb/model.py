@@ -157,11 +157,11 @@ class CLIMB(nn.Module):
 
     def forward(self, x, get_image = False, cam_label= None, view_label=None):
         if get_image == True:
-            if cam_label != None and view_label!=None:
+            if hasattr(self, "cv_embed") and cam_label != None and view_label!=None:
                 cv_embed = self.sie_coe * self.cv_embed[cam_label * self.view_num + view_label]
-            elif cam_label != None:
+            elif hasattr(self, "cv_embed") and cam_label != None:
                 cv_embed = self.sie_coe * self.cv_embed[cam_label]
-            elif view_label!=None:
+            elif hasattr(self, "cv_embed") and view_label!=None:
                 cv_embed = self.sie_coe * self.cv_embed[view_label]
             else:
                 cv_embed = None
@@ -175,11 +175,11 @@ class CLIMB(nn.Module):
             out_feat = torch.cat([feat, feat_proj], dim=1)
             return out_feat
 
-        if cam_label != None and view_label != None:
+        if hasattr(self, "cv_embed") and cam_label != None and view_label != None:
             cv_embed = self.sie_coe * self.cv_embed[cam_label * self.view_num + view_label]
-        elif cam_label != None:
+        elif hasattr(self, "cv_embed") and cam_label != None:
             cv_embed = self.sie_coe * self.cv_embed[cam_label]
-        elif view_label != None:
+        elif hasattr(self, "cv_embed") and view_label != None:
             cv_embed = self.sie_coe * self.cv_embed[view_label]
         else:
             cv_embed = None

@@ -10,20 +10,20 @@ from torch import Tensor
 
 from einops import rearrange, repeat
 
-from mamba.mamba_ssm.ops.selective_scan_interface import selective_scan_fn, mamba_inner_fn, mamba_inner_fn_no_out_proj
+from ..ops.selective_scan_interface import selective_scan_fn, mamba_inner_fn, mamba_inner_fn_no_out_proj
 
 try:
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 except ImportError:
-    causal_conv1d_fn, causal_conv1d_update = None
+    causal_conv1d_fn, causal_conv1d_update = None, None
 
 try:
-    from mamba_ssm.ops.triton.selective_state_update import selective_state_update
+    from ..ops.triton.selective_state_update import selective_state_update
 except ImportError:
     selective_state_update = None
 
 try:
-    from mamba_ssm.ops.triton.layernorm import RMSNorm, layer_norm_fn, rms_norm_fn
+    from ..ops.triton.layernorm import RMSNorm, layer_norm_fn, rms_norm_fn
 except ImportError:
     RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
 
@@ -304,7 +304,7 @@ class BiMamba(nn.Module):
                 ssm_state.copy_(last_state)
             y = rearrange(y, "b d l -> b l d")
             y_b = rearrange(y_b, "b d l -> b l d")
-            out = self.out_proj(y_b + y_f)
+            out = self.out_proj(y_b + y)
         return out
 
     def step(self, hidden_states, conv_state, ssm_state):
