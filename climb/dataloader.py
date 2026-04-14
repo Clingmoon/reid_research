@@ -61,14 +61,15 @@ def make_CLIMB_dataloader(cfg, all_iters=False):
     ])
     val_set = ImageDataset(dataset.query+dataset.gallery, val_transforms)
     num_queries = len(dataset.query)
+    eval_batch = cfg.TEST.IMS_PER_BATCH
     val_loader = DataLoader(
-        val_set, batch_size=4096, shuffle=False, num_workers=num_workers
+        val_set, batch_size=eval_batch, shuffle=False, num_workers=num_workers
     )
     
     # cluster loader
     cluster_set = ImageDataset(dataset.train, val_transforms)
     cluster_loader = DataLoader(
-        cluster_set, batch_size=4096, shuffle=False, num_workers=num_workers
+        cluster_set, batch_size=eval_batch, shuffle=False, num_workers=num_workers
     )
 
     return train_loader, val_loader, cluster_loader, num_queries, num_classes, cam_num, view_num
