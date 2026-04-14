@@ -92,7 +92,7 @@ _C.DATASETS = CN()
 # List of the dataset names for training, as present in paths_catalog.py
 _C.DATASETS.NAMES = ('market1501')
 # Root directory where datasets should be used (and downloaded if not found)
-_C.DATASETS.ROOT_DIR = ('../data')
+_C.DATASETS.ROOT_DIR = ('/home/cfdeng/projects/CLIMB-ReID/datasets/reid-datasets')
 
 _C.DATASETS.ATTR_PATH = ''
 _C.DATASETS.ATTR_NUM = 30

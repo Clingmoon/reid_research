@@ -26,16 +26,27 @@ class MSMT17(BaseImageDataset):
     def __init__(self, root='', verbose=True, pid_begin=0, **kwargs):
         super(MSMT17, self).__init__()
         self.pid_begin = pid_begin
-        # self.dataset_dir = osp.join(root, self.dataset_dir)
+        # Prefer configured ROOT_DIR from config; fallback to legacy hard-coded paths.
+        root0 = '/home/cfdeng/projects/CLIMB-ReID/datasets/reid-datasets/MSMT17_v3'
         root1 = '/dataset_cc/MSMT17_v3/'
         root2 = '/ycy/ba8af05f-f397-4839-a318-f469b124cbab/data/MSMT17_v3'
         root3 = '/YCY/dataset/MSMT17_v3/MSMT17_v3'
-        if osp.exists(root1):
+        configured_root = ''
+        if root:
+            candidate = osp.join(root, 'MSMT17_v3')
+            configured_root = candidate if osp.exists(candidate) else root
+        if configured_root and osp.exists(configured_root):
+            self.root = configured_root
+        elif osp.exists(root0):
+            self.root = root0
+        elif osp.exists(root1):
             self.root = root1
         elif osp.exists(root2):
             self.root = root2
         elif osp.exists(root3):
             self.root = root3
+        else:
+            self.root = configured_root or root
 
         self.train_dir = osp.join(self.root, 'train')
         self.test_dir = osp.join(self.root, 'test')

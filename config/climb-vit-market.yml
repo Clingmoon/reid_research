@@ -44,5 +44,5 @@ TEST:
 
 DATASETS:
   NAMES: ('market1501')
-  ROOT_DIR: ('/home/ok/data/ycy_data')
+  ROOT_DIR: ('/home/cfdeng/projects/CLIMB-ReID/datasets/reid-datasets')
 OUTPUT_DIR: './logs'
