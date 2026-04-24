@@ -49,7 +49,8 @@ def make_CLIMB_dataloader(cfg, all_iters=False):
     train_loader = DataLoader(
         train_set, batch_size=cfg.SOLVER.IMS_PER_BATCH,
         sampler=sampler,
-        num_workers=num_workers
+        num_workers=num_workers,
+        #drop_last=True # MSMT17训练手动调小官方的batch（不推荐，先注释，后在大显存重跑官方batch）故训练时丢弃最后一个不完整 batch，避免小 batch 导致 triplet 挖掘失效或统计不稳定
     )
     train_loader = IterLoader(train_loader, cfg.SOLVER.ITERS if not all_iters else None)
     
@@ -59,7 +60,7 @@ def make_CLIMB_dataloader(cfg, all_iters=False):
         T.ToTensor(),
         T.Normalize(mean=cfg.INPUT.PIXEL_MEAN, std=cfg.INPUT.PIXEL_STD)
     ])
-    val_set = ImageDataset(dataset.query+dataset.gallery, val_transforms)
+    val_set = ImageDataset(dataset.query+dataset.gallery, val_transforms, return_path=True)
     num_queries = len(dataset.query)
     eval_batch = cfg.TEST.IMS_PER_BATCH
     val_loader = DataLoader(

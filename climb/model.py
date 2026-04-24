@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 
 from .vivim import MambaLayer
-from .spmamba import VSSBlock
+#from .spmamba import VSSBlock
 from mamba.mamba_ssm.modules.srmamba import SRMamba
 from mamba.mamba_ssm.modules.bimamba import BiMamba
 from mamba.mamba_ssm.modules.mamba_simple import Mamba
@@ -88,7 +88,7 @@ class CLIMB(nn.Module):
         # Trick: freeze patch projection for improved stability
         # https://arxiv.org/pdf/2104.02057.pdf
         for _, v in self.image_encoder.conv1.named_parameters():
-            v.requires_grad_(False)
+            v.requires_grad_(False)     #冻结了第一层卷积 (conv1) 即 Patch Projection 层的权重
         print('Freeze patch projection layer with shape {}'.format(self.image_encoder.conv1.weight.shape))
 
         if cfg.MODEL.SIE_CAMERA and cfg.MODEL.SIE_VIEW:
@@ -135,7 +135,7 @@ class CLIMB(nn.Module):
             nn.Linear(192, 1)
         )
 
-    def reorder(self, reference, raw):
+    def reorder(self, reference, raw, return_debug=False):
 
         # attention_map = attention_map.mean(axis=1)  # torch.Size([64, 50, 50])
         reference_norm = F.normalize(reference, dim=-1).unsqueeze(1)  # bt, 1, 768
@@ -143,7 +143,7 @@ class CLIMB(nn.Module):
         raw_norm = torch.transpose(raw_norm, 1, 2) # bt, 768, 128
         sim = torch.bmm(reference_norm, raw_norm).squeeze(1)  # [bt, 1, 768] [bt, 768, 128]= [bt, 1, 128]
 
-        sorted, indices = torch.sort(sim, descending=True)
+        _, indices = torch.sort(sim, descending=True)
 
         selected_patch_embedding = []
         for i in range(indices.size(0)):   #bs
@@ -153,9 +153,11 @@ class CLIMB(nn.Module):
           selected_patch_embedding.append(top_k_embedding)
         selected_patch_embedding = torch.cat(selected_patch_embedding, 0)  # torch.Size([64, 128, 768])
 
+        if return_debug:
+            return selected_patch_embedding, sim, indices
         return selected_patch_embedding
 
-    def forward(self, x, get_image = False, cam_label= None, view_label=None):
+    def forward(self, x, get_image = False, cam_label= None, view_label=None, return_visuals=False):
         if get_image == True:
             if hasattr(self, "cv_embed") and cam_label != None and view_label!=None:
                 cv_embed = self.sie_coe * self.cv_embed[cam_label * self.view_num + view_label]
@@ -198,7 +200,15 @@ class CLIMB(nn.Module):
         feats_for_mamba_sp = feats_for_mamba[:, 1:, :].detach()
         feats_for_mamba_cls = feats_for_mamba[:, 0, :].detach()  # torch.Size([64, 768])
         #### reorder
-        re_order_mamba_sp = self.reorder(feats_for_mamba_cls, feats_for_mamba_sp)
+        collect_visuals = return_visuals and not self.training
+
+        if collect_visuals:
+            re_order_mamba_sp, reorder_sim, reorder_indices = self.reorder(
+                feats_for_mamba_cls, feats_for_mamba_sp, return_debug=True
+            )
+        else:
+            re_order_mamba_sp = self.reorder(feats_for_mamba_cls, feats_for_mamba_sp)
+            reorder_sim, reorder_indices = None, None
 
         B, num_token, D = re_order_mamba_sp.shape
         # re_order_mamba_sp = re_order_mamba_sp.reshape(BT, self.h_resolution, self.w_resolution,
@@ -222,6 +232,13 @@ class CLIMB(nn.Module):
             return out_feat, logit, feat_sp, logitsp
         else:
             feat_concat = torch.cat((out_feat, feat_sp), dim=1)
+            if return_visuals:
+                visual_tensors = {
+                    "sim": reorder_sim,
+                    "indices": reorder_indices,
+                    "attn_weights": A,
+                }
+                return feat_concat, out_feat, feat_sp, visual_tensors
             return feat_concat, out_feat, feat_sp
             
 

@@ -169,6 +169,18 @@ class BiMamba(nn.Module):
         self.D_b._no_weight_decay = True
 
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
+        self.debug_vis_enabled = False
+        self.debug_cache = {}
+
+    def set_debug_visualization(self, enabled=False):
+        self.debug_vis_enabled = bool(enabled)
+        if not enabled:
+            self.debug_cache = {}
+
+    def get_and_clear_debug_cache(self):
+        cache = self.debug_cache
+        self.debug_cache = {}
+        return cache
 
     def forward(self, hidden_states, inference_params=None, rate=10):
         """
@@ -228,6 +240,13 @@ class BiMamba(nn.Module):
                 )
             # 将序列反转回来构建:BiMamba
             out_b = out_b.flip([-1])
+            if self.debug_vis_enabled:
+                f_tokens = rearrange(out, "b d l -> b l d")
+                r_tokens = rearrange(out_b, "b d l -> b l d")
+                self.debug_cache = {
+                    "forward_energy": f_tokens.norm(dim=-1).detach().cpu(),
+                    "reverse_energy": r_tokens.norm(dim=-1).detach().cpu(),
+                }
             out = F.linear(rearrange(out + out_b, "b d l -> b l d"), self.out_proj.weight, self.out_proj.bias)
         else:
             # x, z拆分用于两个分支的聚合
@@ -304,6 +323,11 @@ class BiMamba(nn.Module):
                 ssm_state.copy_(last_state)
             y = rearrange(y, "b d l -> b l d")
             y_b = rearrange(y_b, "b d l -> b l d")
+            if self.debug_vis_enabled:
+                self.debug_cache = {
+                    "forward_energy": y.norm(dim=-1).detach().cpu(),
+                    "reverse_energy": y_b.norm(dim=-1).detach().cpu(),
+                }
             out = self.out_proj(y_b + y)
         return out
 

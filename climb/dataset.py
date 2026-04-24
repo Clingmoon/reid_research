@@ -68,9 +68,10 @@ class BaseImageDataset(BaseDataset):
 
 
 class ImageDataset(Dataset):
-    def __init__(self, dataset, transform=None):
+    def __init__(self, dataset, transform=None, return_path=False):
         self.dataset = dataset
         self.transform = transform
+        self.return_path = return_path
 
     def __len__(self):
         return len(self.dataset)
@@ -82,6 +83,8 @@ class ImageDataset(Dataset):
         if self.transform is not None:
             img = self.transform(img)
 
+        if self.return_path:
+            return img, pid, camid, trackid, img_path
         return img, pid, camid, trackid
     
 class PseudoLabelImageDataset(ImageDataset):

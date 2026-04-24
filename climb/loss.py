@@ -150,6 +150,8 @@ class ClusterMemoryAMP(nn.Module, ABC):
         self.temp = temp
         self.use_hard = use_hard
         self.features = None
+        self.last_mean_ce = 0.0
+        self.last_hard_ce = 0.0
 
     def forward(self, inputs, targets, cams=None, epoch=None):
         inputs = F.normalize(inputs, dim=1).cuda()
@@ -162,7 +164,11 @@ class ClusterMemoryAMP(nn.Module, ABC):
         outputs /= self.temp
         
         mean, hard = torch.chunk(outputs, 2, dim=1)
-        loss = 0.5 * (F.cross_entropy(hard, targets) + F.cross_entropy(mean, targets))
+        hard_ce = F.cross_entropy(hard, targets)
+        mean_ce = F.cross_entropy(mean, targets)
+        self.last_mean_ce = float(mean_ce.detach().cpu())
+        self.last_hard_ce = float(hard_ce.detach().cpu())
+        loss = 0.5 * (hard_ce + mean_ce)
         return loss
     
     
@@ -319,6 +325,11 @@ class TripletLoss(object):
             self.ranking_loss = nn.SoftMarginLoss()
 
     def __call__(self, global_feat, labels, normalize_feature=False):
+        #下述注释内容同climb.dataloader:52共同解决MSMT17手动调小batch导致的问题，和 drop_last=True 是配套思路：一个从数据侧规避，一个从损失侧兜底
+        # # If a batch has fewer than 2 identities, triplet mining has no negatives.
+        # # Return a zero loss tensor on the right device/dtype to keep training stable.
+        # if labels.numel() < 2 or labels.unique().numel() < 2:  # 当 batch 里 identity 不足（<2 类）时返回 0 loss，防止 triplet loss 在“无负样本”场景报错/产生异常梯度
+        #     return global_feat.sum() * 0.0
         if normalize_feature:
             global_feat = normalize(global_feat, axis=-1)
         dist_mat = euclidean_dist(global_feat, global_feat) #B,B
