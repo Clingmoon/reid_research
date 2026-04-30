@@ -1,5 +1,11 @@
 uv.lock
+.venv/
 __pycache__/
 *.pyc
 datasets/reid-datasets
 logs/
+logs*/
+VMamba/
+config/*.pt
+*.pth
+*.pth.tar
