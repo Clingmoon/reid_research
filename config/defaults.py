@@ -66,6 +66,15 @@ _C.MODEL.PCL_LOSS_WEIGHT = 1.0
 # memory bank
 _C.MODEL.MEMORY_MOMENTUM = 0.2
 
+# Spatial sequence modeling branch for CLIMB image patch tokens.
+# Options: 'bimamba' keeps the official IRM-style reorder + BiMamba branch;
+# 'ss2d' uses VMamba SS2D on the original H x W patch grid without reorder.
+_C.MODEL.SPATIAL_BRANCH_TYPE = 'bimamba'
+_C.MODEL.SS2D_FORWARD_TYPE = 'v1'
+_C.MODEL.SS2D_D_STATE = 16
+_C.MODEL.SS2D_SSM_RATIO = 2.0
+_C.MODEL.SS2D_D_CONV = 3
+
 # -----------------------------------------------------------------------------
 # INPUT
 # -----------------------------------------------------------------------------

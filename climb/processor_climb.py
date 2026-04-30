@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader, Subset
 import torch.nn.functional as F
 import torch.nn as nn
 from utils.meter import AverageMeter
-from utils.metrics import R1_mAP_eval
+from utils.metrics import R1_mAP_eval, euclidean_distance
 from .utils import *
 from .loss import ClusterMemoryAMP, CrossEntropyLabelSmooth, TripletLoss
 
@@ -41,6 +41,11 @@ def _resolve_attention_map(attn_weights, indices, batch_size, logger=None, tag=N
     restored_attn = torch.zeros_like(attn_weights)
     restored_attn.scatter_(1, indices, attn_weights)
     return restored_attn
+
+
+def _get_spatial_branch_name(model):
+    module = model.module if hasattr(model, "module") else model
+    return getattr(module, "spatial_branch_name", "BiMamba")
 
 
 def _save_comparison_visuals(samples, output_dir, file_prefix, h_tokens, w_tokens, pixel_mean, pixel_std):
@@ -74,33 +79,38 @@ def _save_comparison_visuals(samples, output_dir, file_prefix, h_tokens, w_token
         axes[2].imshow(img_np)
         patch_h = img_h / float(h_tokens)
         patch_w = img_w / float(w_tokens)
-        topk = min(10, sample["indices"].numel())
-        for rank_idx, patch_idx in enumerate(sample["indices"][:topk].tolist(), start=1):
-            row = patch_idx // w_tokens
-            col = patch_idx % w_tokens
-            rect = Rectangle(
-                (col * patch_w, row * patch_h),
-                patch_w,
-                patch_h,
-                fill=False,
-                edgecolor="red",
-                linewidth=2,
-            )
-            axes[2].add_patch(rect)
-            axes[2].text(
-                col * patch_w + 2,
-                row * patch_h + 14,
-                str(rank_idx),
-                color="white",
-                fontsize=10,
-                bbox=dict(facecolor="red", edgecolor="red", pad=1.0),
-            )
-        axes[2].set_title("(c) Patch Reordering (Top-10)")
+        identity_indices = torch.arange(sample["indices"].numel(), dtype=sample["indices"].dtype)
+        is_identity_order = torch.equal(sample["indices"].cpu(), identity_indices)
+        if is_identity_order:
+            axes[2].set_title("(c) Patch Grid (No Reorder)")
+        else:
+            topk = min(10, sample["indices"].numel())
+            for rank_idx, patch_idx in enumerate(sample["indices"][:topk].tolist(), start=1):
+                row = patch_idx // w_tokens
+                col = patch_idx % w_tokens
+                rect = Rectangle(
+                    (col * patch_w, row * patch_h),
+                    patch_w,
+                    patch_h,
+                    fill=False,
+                    edgecolor="red",
+                    linewidth=2,
+                )
+                axes[2].add_patch(rect)
+                axes[2].text(
+                    col * patch_w + 2,
+                    row * patch_h + 14,
+                    str(rank_idx),
+                    color="white",
+                    fontsize=10,
+                    bbox=dict(facecolor="red", edgecolor="red", pad=1.0),
+                )
+            axes[2].set_title("(c) Patch Reordering (Top-10)")
         axes[2].axis("off")
 
         axes[3].imshow(img_np)
         axes[3].imshow(attn_map, cmap="jet", alpha=0.45)
-        axes[3].set_title("(d) BiMamba Final Attention")
+        axes[3].set_title("(d) {} Final Attention".format(sample.get("branch_name", "BiMamba")))
         axes[3].axis("off")
 
         plt.tight_layout(pad=0.6, w_pad=0.4)
@@ -359,6 +369,8 @@ def train_climb(cfg,
         memory = ClusterMemoryAMP(momentum=cfg.MODEL.MEMORY_MOMENTUM, use_hard=True).to(device)
         memory.features = compute_cluster_centroids(image_features, gt_labels).to(device)
         logger.info('Create memory bank with shape = {}'.format(memory.features.shape))
+        del image_features, gt_labels
+        torch.cuda.empty_cache()
         
         # train one iteration
         model.train()
@@ -541,6 +553,7 @@ def train_climb(cfg,
                                     "sim": sim[sample_idx].clone(),
                                     "indices": indices[sample_idx].clone(),
                                     "restored_attn": restored_attn[sample_idx].clone(),
+                                    "branch_name": _get_spatial_branch_name(model),
                                     "pid": int(np.asarray(vid)[sample_idx]),
                                     "camid": int(np.asarray(camid)[sample_idx]),
                                     "epoch": int(epoch),
@@ -567,7 +580,8 @@ def train_climb(cfg,
             logger.info("mAP_1(CLIP): {:.5%}".format(mAP01))
             for r in [1, 5, 10, 20]:
                 logger.info("CMC curve, Rank-{:<3}:{:.5%}".format(r, cmc01[r - 1]))
-            logger.info("mAP_2(BiMamba): {:.5%}".format(mAP02))
+            branch_name = _get_spatial_branch_name(model)
+            logger.info("mAP_2({}): {:.5%}".format(branch_name, mAP02))
             for r in [1, 5, 10, 20]:
                 logger.info("CMC curve, Rank-{:<3}:{:.5%}".format(r, cmc02[r - 1]))
             logger.info("mAP_3: {:.5%}".format(mAP03))
@@ -671,6 +685,7 @@ def do_inference(cfg,
                     "sim": sim[sample_idx].clone(),
                     "indices": indices[sample_idx].clone(),
                     "restored_attn": restored_attn[sample_idx].clone(),
+                    "branch_name": _get_spatial_branch_name(model),
                     "pid": pid_value,
                     "camid": camid_value,
                     "image_key": image_key,

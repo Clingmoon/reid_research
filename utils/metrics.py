@@ -98,6 +98,109 @@ def eval_func(distmat, q_pids, g_pids, q_camids, g_camids, max_rank=50):
     return all_cmc, mAP
 
 
+def _eval_sorted_indices(indices, q_pids, g_pids, q_camids, g_camids, max_rank):
+    all_cmc = []
+    all_AP = []
+    num_valid_q = 0.
+
+    for q_idx in range(indices.shape[0]):
+        q_pid = q_pids[q_idx]
+        q_camid = q_camids[q_idx]
+        order = indices[q_idx]
+
+        remove = (g_pids[order] == q_pid) & (g_camids[order] == q_camid)
+        keep = np.invert(remove)
+        orig_cmc = (g_pids[order] == q_pid).astype(np.int32)[keep]
+        if not np.any(orig_cmc):
+            continue
+
+        cmc = orig_cmc.cumsum()
+        cmc[cmc > 1] = 1
+        all_cmc.append(cmc[:max_rank])
+        num_valid_q += 1.
+
+        num_rel = orig_cmc.sum()
+        tmp_cmc = orig_cmc.cumsum()
+        tmp_cmc = tmp_cmc / (np.arange(1, tmp_cmc.shape[0] + 1) * 1.0)
+        AP = (tmp_cmc * orig_cmc).sum() / num_rel
+        all_AP.append(AP)
+
+    return all_cmc, all_AP, num_valid_q
+
+
+def _finalize_cmc_map(all_cmc, all_AP, num_valid_q):
+    assert num_valid_q > 0, "Error: all query identities do not appear in gallery"
+    all_cmc = np.asarray(all_cmc).astype(np.float32)
+    all_cmc = all_cmc.sum(0) / num_valid_q
+    mAP = np.mean(all_AP)
+    return all_cmc, mAP
+
+
+def _query_chunk_size():
+    return max(1, int(os.environ.get('EVAL_QUERY_CHUNK_SIZE', 128)))
+
+
+def eval_func_chunked(qf, gf, q_pids, g_pids, q_camids, g_camids, max_rank=50,
+                      metric='euclidean', query_chunk_size=None, qf2=None, gf2=None):
+    num_q = qf.shape[0]
+    num_g = gf.shape[0]
+    if num_g < max_rank:
+        max_rank = num_g
+        print("Note: number of gallery samples is quite small, got {}".format(num_g))
+
+    query_chunk_size = query_chunk_size or _query_chunk_size()
+    all_cmc = []
+    all_AP = []
+    num_valid_q = 0.
+
+    with torch.no_grad():
+        qf = qf.float()
+        gf = gf.float()
+        if metric == 'euclidean':
+            gf_t = gf.t().contiguous()
+            gf_square = torch.pow(gf, 2).sum(dim=1, keepdim=True).t()
+        elif metric in ('cosine', 'cosine_sum'):
+            qf = torch.nn.functional.normalize(qf, dim=1, p=2)
+            gf = torch.nn.functional.normalize(gf, dim=1, p=2)
+            gf_t = gf.t().contiguous()
+            if metric == 'cosine_sum':
+                qf2 = torch.nn.functional.normalize(qf2.float(), dim=1, p=2)
+                gf2 = torch.nn.functional.normalize(gf2.float(), dim=1, p=2)
+                gf2_t = gf2.t().contiguous()
+        else:
+            raise ValueError('Unsupported chunked metric: {}'.format(metric))
+
+        for start in range(0, num_q, query_chunk_size):
+            end = min(start + query_chunk_size, num_q)
+            q_chunk = qf[start:end]
+
+            if metric == 'euclidean':
+                dist_chunk = torch.pow(q_chunk, 2).sum(dim=1, keepdim=True) + gf_square
+                dist_chunk.addmm_(q_chunk, gf_t, beta=1, alpha=-2)
+            elif metric == 'cosine':
+                dist_chunk = -torch.mm(q_chunk, gf_t)
+            else:
+                dist_chunk = -torch.mm(q_chunk, gf_t)
+                dist_chunk.addmm_(qf2[start:end], gf2_t, beta=1, alpha=-1)
+
+            indices = np.argsort(dist_chunk.cpu().numpy(), axis=1)
+            chunk_cmc, chunk_AP, chunk_valid_q = _eval_sorted_indices(
+                indices,
+                q_pids[start:end],
+                g_pids,
+                q_camids[start:end],
+                g_camids,
+                max_rank,
+            )
+            all_cmc.extend(chunk_cmc)
+            all_AP.extend(chunk_AP)
+            num_valid_q += chunk_valid_q
+
+            del dist_chunk, indices
+
+    return _finalize_cmc_map(all_cmc, all_AP, num_valid_q)
+
+
 class R1_mAP_eval():
     def __init__(self, num_query, max_rank=50, feat_norm=True, reranking=False):
         super(R1_mAP_eval, self).__init__()
@@ -147,18 +250,41 @@ class R1_mAP_eval():
             print('=> Enter reranking')
             # distmat = re_ranking(qf, gf, k1=20, k2=6, lambda_value=0.3)
             distmat = re_ranking(qf, gf, k1=50, k2=15, lambda_value=0.3)
+            distmat01 = org_cosine_similarity(qf0, gf0)
+            distmat02 = org_cosine_similarity(qf1, gf1)
+            cmc, mAP = eval_func(distmat, q_pids, g_pids, q_camids, g_camids)
+            cmc01, mAP01 = eval_func(distmat01, q_pids, g_pids, q_camids, g_camids)
+            cmc02, mAP02 = eval_func(distmat02, q_pids, g_pids, q_camids, g_camids)
+            cmc03, mAP03 = eval_func(distmat01 + distmat02, q_pids, g_pids, q_camids, g_camids)
 
         else:
-            print('=> Computing DistMat with euclidean_distance')
-            distmat = euclidean_distance(qf, gf)
-            # distmat = org_cosine_similarity(qf, gf)
-        distmat01 = org_cosine_similarity(qf0, gf0)
-        distmat02 = org_cosine_similarity(qf1, gf1)
-        cmc, mAP = eval_func(distmat, q_pids, g_pids, q_camids, g_camids)
-        cmc01, mAP01 = eval_func(distmat01, q_pids, g_pids, q_camids, g_camids)
-        cmc02, mAP02 = eval_func(distmat02, q_pids, g_pids, q_camids, g_camids)
-        cmc03, mAP03 = eval_func(distmat01 + distmat02, q_pids, g_pids, q_camids, g_camids)
+            query_chunk_size = _query_chunk_size()
+            print('=> Computing metrics with chunked evaluation, query chunk size={}'.format(query_chunk_size))
+            cmc, mAP = eval_func_chunked(
+                qf, gf, q_pids, g_pids, q_camids, g_camids,
+                max_rank=self.max_rank,
+                metric='euclidean',
+                query_chunk_size=query_chunk_size,
+            )
+            cmc01, mAP01 = eval_func_chunked(
+                qf0, gf0, q_pids, g_pids, q_camids, g_camids,
+                max_rank=self.max_rank,
+                metric='cosine',
+                query_chunk_size=query_chunk_size,
+            )
+            cmc02, mAP02 = eval_func_chunked(
+                qf1, gf1, q_pids, g_pids, q_camids, g_camids,
+                max_rank=self.max_rank,
+                metric='cosine',
+                query_chunk_size=query_chunk_size,
+            )
+            cmc03, mAP03 = eval_func_chunked(
+                qf0, gf0, q_pids, g_pids, q_camids, g_camids,
+                max_rank=self.max_rank,
+                metric='cosine_sum',
+                query_chunk_size=query_chunk_size,
+                qf2=qf1,
+                gf2=gf1,
+            )
         return cmc, mAP, cmc01, mAP01, cmc02, mAP02, cmc03, mAP03
-
-
 

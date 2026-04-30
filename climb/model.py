@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 
 from .vivim import MambaLayer
-#from .spmamba import VSSBlock
+from .spmamba import SS2D
 from mamba.mamba_ssm.modules.srmamba import SRMamba
 from mamba.mamba_ssm.modules.bimamba import BiMamba
 from mamba.mamba_ssm.modules.mamba_simple import Mamba
@@ -54,6 +54,32 @@ def load_clip_to_cpu(backbone_name, h_resolution, w_resolution, vision_stride_si
     model = clip.build_model(state_dict or model.state_dict(), h_resolution, w_resolution, vision_stride_size)
 
     return model
+
+
+class SS2DTokenAdapter(nn.Module):
+    def __init__(self, h_resolution, w_resolution, d_model=768, d_state=16,
+                 ssm_ratio=2.0, d_conv=3, forward_type='v2'):
+        super().__init__()
+        self.h_resolution = h_resolution
+        self.w_resolution = w_resolution
+        self.norm = nn.LayerNorm(d_model)
+        self.ss2d = SS2D(
+            d_model=d_model,
+            d_state=d_state,
+            ssm_ratio=ssm_ratio,
+            d_conv=d_conv,
+            forward_type=forward_type,
+        )
+
+    def forward(self, tokens):
+        batch_size, num_tokens, dim = tokens.shape
+        expected_tokens = self.h_resolution * self.w_resolution
+        if num_tokens != expected_tokens:
+            raise ValueError('SS2D expected {} patch tokens, got {}'.format(expected_tokens, num_tokens))
+        x = self.norm(tokens).reshape(batch_size, self.h_resolution, self.w_resolution, dim)
+        x = self.ss2d(x)
+        return x.reshape(batch_size, num_tokens, dim).contiguous()
+
 
 class CLIMB(nn.Module):
     def __init__(self, num_classes, camera_num, view_num, cfg):
@@ -109,15 +135,33 @@ class CLIMB(nn.Module):
         self.bottleneck_proj_sp = nn.BatchNorm1d(self.in_planes)
         self.bottleneck_proj_sp.bias.requires_grad_(False)
         self.bottleneck_proj_sp.apply(weights_init_kaiming)
-        self.sp_mamba_bi = nn.Sequential(
-            nn.LayerNorm(768),
-            BiMamba(
+        self.spatial_branch_type = cfg.MODEL.SPATIAL_BRANCH_TYPE.lower()
+        if self.spatial_branch_type == 'ss2d':
+            self.spatial_branch_name = 'SS2D'
+            self.sp_mamba_bi = SS2DTokenAdapter(
+                self.h_resolution,
+                self.w_resolution,
                 d_model=768,
-                d_state=16,
-                d_conv=4,
-                expand=2,
-            ),
-        )
+                d_state=cfg.MODEL.SS2D_D_STATE,
+                ssm_ratio=cfg.MODEL.SS2D_SSM_RATIO,
+                d_conv=cfg.MODEL.SS2D_D_CONV,
+                forward_type=cfg.MODEL.SS2D_FORWARD_TYPE,
+            )
+            print('Using SS2D spatial branch on patch grid {}x{}'.format(self.h_resolution, self.w_resolution))
+        elif self.spatial_branch_type == 'bimamba':
+            self.spatial_branch_name = 'BiMamba'
+            self.sp_mamba_bi = nn.Sequential(
+                nn.LayerNorm(768),
+                BiMamba(
+                    d_model=768,
+                    d_state=16,
+                    d_conv=4,
+                    expand=2,
+                ),
+            )
+            print('Using BiMamba reorder branch')
+        else:
+            raise ValueError('Unsupported MODEL.SPATIAL_BRANCH_TYPE: {}'.format(cfg.MODEL.SPATIAL_BRANCH_TYPE))
         self.sp_mamba_raw = nn.Sequential(
             nn.LayerNorm(768),
             Mamba(
@@ -202,19 +246,31 @@ class CLIMB(nn.Module):
         #### reorder
         collect_visuals = return_visuals and not self.training
 
-        if collect_visuals:
-            re_order_mamba_sp, reorder_sim, reorder_indices = self.reorder(
-                feats_for_mamba_cls, feats_for_mamba_sp, return_debug=True
-            )
+        if self.spatial_branch_type == 'ss2d':
+            mamba_input = feats_for_mamba_sp
+            if collect_visuals:
+                reference_norm = F.normalize(feats_for_mamba_cls, dim=-1).unsqueeze(1)
+                patch_norm = F.normalize(feats_for_mamba_sp, dim=-1).transpose(1, 2)
+                reorder_sim = torch.bmm(reference_norm, patch_norm).squeeze(1)
+                reorder_indices = torch.arange(
+                    feats_for_mamba_sp.size(1), device=feats_for_mamba_sp.device
+                ).unsqueeze(0).expand(feats_for_mamba_sp.size(0), -1)
+            else:
+                reorder_sim, reorder_indices = None, None
         else:
-            re_order_mamba_sp = self.reorder(feats_for_mamba_cls, feats_for_mamba_sp)
-            reorder_sim, reorder_indices = None, None
+            if collect_visuals:
+                mamba_input, reorder_sim, reorder_indices = self.reorder(
+                    feats_for_mamba_cls, feats_for_mamba_sp, return_debug=True
+                )
+            else:
+                mamba_input = self.reorder(feats_for_mamba_cls, feats_for_mamba_sp)
+                reorder_sim, reorder_indices = None, None
 
-        B, num_token, D = re_order_mamba_sp.shape
-        # re_order_mamba_sp = re_order_mamba_sp.reshape(BT, self.h_resolution, self.w_resolution,
+        B, num_token, D = mamba_input.shape
+        # mamba_input = mamba_input.reshape(BT, self.h_resolution, self.w_resolution,
         #                                              D)  # torch.Size([64, 16, 8, 768])
-        # mamba_sp_out = self.sp_mamba_raw(re_order_mamba_sp)  # torch.Size([64, 128, 768])
-        mamba_sp_out = self.sp_mamba_bi(re_order_mamba_sp)  # torch.Size([64, 16, 8, 768])
+        # mamba_sp_out = self.sp_mamba_raw(mamba_input)  # torch.Size([64, 128, 768])
+        mamba_sp_out = self.sp_mamba_bi(mamba_input)  # torch.Size([64, 128, 768])
         # mamba_sp_out = mamba_sp_out.reshape(B, self.h_resolution * self.w_resolution, D).contiguous()
         mamba_sp_out = torch.cat((feats_for_mamba_cls.unsqueeze(1), mamba_sp_out), dim=1)  # torch.Size([64, 129, 768])
         # mamba_sp_out = mamba_sp_out.mean(1)  # torch.Size([64, 768])
