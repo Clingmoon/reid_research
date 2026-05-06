@@ -66,6 +66,14 @@ _C.MODEL.PCL_LOSS_WEIGHT = 1.0
 # memory bank
 _C.MODEL.MEMORY_MOMENTUM = 0.2
 
+# CMIC content-adaptive cluster Mamba branch
+_C.MODEL.CAM_D_STATE = 16
+_C.MODEL.CAM_CLUSTER_NUM = 16
+_C.MODEL.CAM_INNER_RANK = 128
+_C.MODEL.CAM_MLP_RATIO = 2.0
+_C.MODEL.CAM_N_ITER = 5
+_C.MODEL.CAM_EMA_DECAY = 0.999
+
 # -----------------------------------------------------------------------------
 # INPUT
 # -----------------------------------------------------------------------------

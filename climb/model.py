@@ -5,11 +5,7 @@ import os.path
 import torch.nn.functional as F
 
 
-from .vivim import MambaLayer
-#from .spmamba import VSSBlock
-from mamba.mamba_ssm.modules.srmamba import SRMamba
-from mamba.mamba_ssm.modules.bimamba import BiMamba
-from mamba.mamba_ssm.modules.mamba_simple import Mamba
+from .cam_mamba import CAM
 def weights_init_kaiming(m):
     classname = m.__class__.__name__
     if classname.find('Linear') != -1:
@@ -109,24 +105,17 @@ class CLIMB(nn.Module):
         self.bottleneck_proj_sp = nn.BatchNorm1d(self.in_planes)
         self.bottleneck_proj_sp.bias.requires_grad_(False)
         self.bottleneck_proj_sp.apply(weights_init_kaiming)
-        self.sp_mamba_bi = nn.Sequential(
-            nn.LayerNorm(768),
-            BiMamba(
-                d_model=768,
-                d_state=16,
-                d_conv=4,
-                expand=2,
-            ),
+        self.spatial_branch_name = 'CMIC-CAM'
+        self.cam_mamba = CAM(
+            dim=768,
+            d_state=cfg.MODEL.CAM_D_STATE,
+            cluster_num=cfg.MODEL.CAM_CLUSTER_NUM,
+            inner_rank=cfg.MODEL.CAM_INNER_RANK,
+            mlp_ratio=cfg.MODEL.CAM_MLP_RATIO,
+            n_iter=cfg.MODEL.CAM_N_ITER,
+            ema_decay=cfg.MODEL.CAM_EMA_DECAY,
         )
-        self.sp_mamba_raw = nn.Sequential(
-            nn.LayerNorm(768),
-            Mamba(
-                d_model=768,
-                d_state=16,
-                d_conv=4,
-                expand=2,
-            ),
-        )
+        print('Using CMIC-CAM spatial branch with cluster_num={}'.format(cfg.MODEL.CAM_CLUSTER_NUM))
         self.norm2_mamba = nn.LayerNorm(768)
         self.norm3_mamba = nn.LayerNorm(768)
         self.sp_attention = nn.Sequential(
@@ -134,28 +123,6 @@ class CLIMB(nn.Module):
             nn.Tanh(),
             nn.Linear(192, 1)
         )
-
-    def reorder(self, reference, raw, return_debug=False):
-
-        # attention_map = attention_map.mean(axis=1)  # torch.Size([64, 50, 50])
-        reference_norm = F.normalize(reference, dim=-1).unsqueeze(1)  # bt, 1, 768
-        raw_norm = F.normalize(raw, dim=-1)  # bt, 128, 768
-        raw_norm = torch.transpose(raw_norm, 1, 2) # bt, 768, 128
-        sim = torch.bmm(reference_norm, raw_norm).squeeze(1)  # [bt, 1, 768] [bt, 768, 128]= [bt, 1, 128]
-
-        _, indices = torch.sort(sim, descending=True)
-
-        selected_patch_embedding = []
-        for i in range(indices.size(0)):   #bs
-          all_patch_embeddings_i = raw[i, :,:].squeeze()  # torch.Size([128, 768])
-          top_k_embedding = torch.index_select(all_patch_embeddings_i, 0, indices[i])  # torch.Size([128, 768])
-          top_k_embedding = top_k_embedding.unsqueeze(0)  # torch.Size([1, 128, 768])
-          selected_patch_embedding.append(top_k_embedding)
-        selected_patch_embedding = torch.cat(selected_patch_embedding, 0)  # torch.Size([64, 128, 768])
-
-        if return_debug:
-            return selected_patch_embedding, sim, indices
-        return selected_patch_embedding
 
     def forward(self, x, get_image = False, cam_label= None, view_label=None, return_visuals=False):
         if get_image == True:
@@ -199,23 +166,22 @@ class CLIMB(nn.Module):
         # feats_for_mamba = feats_for_mamba.permute(0, 2, 1)  # torch.Size([64, 768, 128])
         feats_for_mamba_sp = feats_for_mamba[:, 1:, :].detach()
         feats_for_mamba_cls = feats_for_mamba[:, 0, :].detach()  # torch.Size([64, 768])
-        #### reorder
         collect_visuals = return_visuals and not self.training
 
         if collect_visuals:
-            re_order_mamba_sp, reorder_sim, reorder_indices = self.reorder(
-                feats_for_mamba_cls, feats_for_mamba_sp, return_debug=True
-            )
+            reference_norm = F.normalize(feats_for_mamba_cls, dim=-1).unsqueeze(1)
+            patch_norm = F.normalize(feats_for_mamba_sp, dim=-1).transpose(1, 2)
+            reorder_sim = torch.bmm(reference_norm, patch_norm).squeeze(1)
+            reorder_indices = torch.arange(
+                feats_for_mamba_sp.size(1), device=feats_for_mamba_sp.device
+            ).unsqueeze(0).expand(feats_for_mamba_sp.size(0), -1)
         else:
-            re_order_mamba_sp = self.reorder(feats_for_mamba_cls, feats_for_mamba_sp)
             reorder_sim, reorder_indices = None, None
 
-        B, num_token, D = re_order_mamba_sp.shape
-        # re_order_mamba_sp = re_order_mamba_sp.reshape(BT, self.h_resolution, self.w_resolution,
-        #                                              D)  # torch.Size([64, 16, 8, 768])
-        # mamba_sp_out = self.sp_mamba_raw(re_order_mamba_sp)  # torch.Size([64, 128, 768])
-        mamba_sp_out = self.sp_mamba_bi(re_order_mamba_sp)  # torch.Size([64, 16, 8, 768])
-        # mamba_sp_out = mamba_sp_out.reshape(B, self.h_resolution * self.w_resolution, D).contiguous()
+        mamba_sp_out = self.cam_mamba(
+            feats_for_mamba_sp,
+            (self.h_resolution, self.w_resolution),
+        )
         mamba_sp_out = torch.cat((feats_for_mamba_cls.unsqueeze(1), mamba_sp_out), dim=1)  # torch.Size([64, 129, 768])
         # mamba_sp_out = mamba_sp_out.mean(1)  # torch.Size([64, 768])
         mamba_sp_out2 = self.norm2_mamba(mamba_sp_out)  # bt, 128, 768
@@ -237,6 +203,7 @@ class CLIMB(nn.Module):
                     "sim": reorder_sim,
                     "indices": reorder_indices,
                     "attn_weights": A,
+                    "branch_name": self.spatial_branch_name,
                 }
                 return feat_concat, out_feat, feat_sp, visual_tensors
             return feat_concat, out_feat, feat_sp
