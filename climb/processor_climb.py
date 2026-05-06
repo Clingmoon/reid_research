@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader, Subset
 import torch.nn.functional as F
 import torch.nn as nn
 from utils.meter import AverageMeter
-from utils.metrics import R1_mAP_eval
+from utils.metrics import R1_mAP_eval, euclidean_distance
 from .utils import *
 from .loss import ClusterMemoryAMP, CrossEntropyLabelSmooth, TripletLoss
 
