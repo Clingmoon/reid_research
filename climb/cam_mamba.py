@@ -344,6 +344,7 @@ class CAM(nn.Module):
         self,
         x: torch.Tensor,
         x_size: Tuple[int, int],
+        return_cluster: bool = False,
     ) -> torch.Tensor:
         batch_size, num_tokens, channels = x.shape
         height, width = x_size
@@ -377,4 +378,6 @@ class CAM(nn.Module):
         y = self.selectiveScan(semantic_x, prompt)
         y = self.out_proj(self.out_norm(y))
         x_out = apply_permute(y, inv_idx)
+        if return_cluster:
+            return x_out, cluster_idx
         return x_out

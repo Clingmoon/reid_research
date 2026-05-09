@@ -178,10 +178,18 @@ class CLIMB(nn.Module):
         else:
             reorder_sim, reorder_indices = None, None
 
-        mamba_sp_out = self.cam_mamba(
-            feats_for_mamba_sp,
-            (self.h_resolution, self.w_resolution),
-        )
+        if collect_visuals:
+            mamba_sp_out, cluster_idx = self.cam_mamba(
+                feats_for_mamba_sp,
+                (self.h_resolution, self.w_resolution),
+                return_cluster=True,
+            )
+        else:
+            mamba_sp_out = self.cam_mamba(
+                feats_for_mamba_sp,
+                (self.h_resolution, self.w_resolution),
+            )
+            cluster_idx = None
         mamba_sp_out = torch.cat((feats_for_mamba_cls.unsqueeze(1), mamba_sp_out), dim=1)  # torch.Size([64, 129, 768])
         # mamba_sp_out = mamba_sp_out.mean(1)  # torch.Size([64, 768])
         mamba_sp_out2 = self.norm2_mamba(mamba_sp_out)  # bt, 128, 768
@@ -204,6 +212,8 @@ class CLIMB(nn.Module):
                     "indices": reorder_indices,
                     "attn_weights": A,
                     "branch_name": self.spatial_branch_name,
+                    "cluster_idx": cluster_idx,
+                    "cluster_num": self.cam_mamba.cluster_num,
                 }
                 return feat_concat, out_feat, feat_sp, visual_tensors
             return feat_concat, out_feat, feat_sp

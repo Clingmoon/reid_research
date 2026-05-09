@@ -65,7 +65,11 @@ def _save_comparison_visuals(samples, output_dir, file_prefix, h_tokens, w_token
         attn_map = F.interpolate(attn_map, size=(img_h, img_w), mode="bilinear", align_corners=False)
         attn_map = attn_map.squeeze().numpy()
 
-        fig, axes = plt.subplots(1, 4, figsize=(20, 5), gridspec_kw={"wspace": 0.1})
+        cluster_idx = sample.get("cluster_idx")
+        has_cluster_map = cluster_idx is not None
+        num_panels = 5 if has_cluster_map else 4
+        fig_width = 25 if has_cluster_map else 20
+        fig, axes = plt.subplots(1, num_panels, figsize=(fig_width, 5), gridspec_kw={"wspace": 0.1})
 
         axes[0].imshow(img_np)
         axes[0].set_title("(a) Original Input")
@@ -108,10 +112,29 @@ def _save_comparison_visuals(samples, output_dir, file_prefix, h_tokens, w_token
             axes[2].set_title("(c) Patch Reordering (Top-10)")
         axes[2].axis("off")
 
-        axes[3].imshow(img_np)
-        axes[3].imshow(attn_map, cmap="jet", alpha=0.45)
-        axes[3].set_title("(d) {} Final Attention".format(sample.get("branch_name", "BiMamba")))
-        axes[3].axis("off")
+        attention_axis_idx = 3
+        if has_cluster_map:
+            cluster_grid = cluster_idx.view(1, 1, h_tokens, w_tokens).float()
+            cluster_grid = F.interpolate(cluster_grid, size=(img_h, img_w), mode="nearest")
+            cluster_grid = cluster_grid.squeeze().numpy().astype(np.int32)
+            cluster_num = int(sample.get("cluster_num", int(cluster_grid.max()) + 1))
+            cmap = plt.get_cmap("tab20")
+            normalized_grid = cluster_grid / float(max(cluster_num - 1, 1))
+            cluster_color_map = cmap(normalized_grid)[:, :, :3]
+            blended_cluster_map = img_np * 0.5 + cluster_color_map * 0.5
+
+            axes[3].imshow(blended_cluster_map)
+            axes[3].set_title("(d) CAM Patch Clusters")
+            axes[3].axis("off")
+            attention_axis_idx = 4
+
+        axes[attention_axis_idx].imshow(img_np)
+        axes[attention_axis_idx].imshow(attn_map, cmap="jet", alpha=0.45)
+        panel_label = "(e)" if has_cluster_map else "(d)"
+        axes[attention_axis_idx].set_title(
+            "{} {} Final Attention".format(panel_label, sample.get("branch_name", "BiMamba"))
+        )
+        axes[attention_axis_idx].axis("off")
 
         plt.tight_layout(pad=0.6, w_pad=0.4)
         save_name = _build_visual_filename(sample, image_key, file_prefix=file_prefix)
@@ -538,6 +561,10 @@ def train_climb(cfg,
                             sim = visual_tensors["sim"].detach().cpu()
                             indices = visual_tensors["indices"].detach().cpu().long()
                             attn_weights = visual_tensors["attn_weights"].detach().cpu()
+                            cluster_idx = visual_tensors.get("cluster_idx")
+                            cluster_num = visual_tensors.get("cluster_num")
+                            if cluster_idx is not None:
+                                cluster_idx = cluster_idx.detach().cpu().long()
                             batch_size = img_cpu.size(0)
                             if sim.dim() == 3:
                                 sim = sim.squeeze(1)
@@ -558,6 +585,9 @@ def train_climb(cfg,
                                     "reason": selected_targets[image_key]["reason"],
                                     "branch_name": _get_spatial_branch_name(model),
                                 }
+                                if cluster_idx is not None:
+                                    epoch_visuals[image_key]["cluster_idx"] = cluster_idx[sample_idx].clone()
+                                    epoch_visuals[image_key]["cluster_num"] = int(cluster_num or cluster_idx.max().item() + 1)
 
                             if len(epoch_visuals) == len(selected_targets):
                                 break
@@ -667,6 +697,10 @@ def do_inference(cfg,
             sim = visual_tensors["sim"].detach().cpu()
             indices = visual_tensors["indices"].detach().cpu().long()
             attn_weights = visual_tensors["attn_weights"].detach().cpu()
+            cluster_idx = visual_tensors.get("cluster_idx")
+            cluster_num = visual_tensors.get("cluster_num")
+            if cluster_idx is not None:
+                cluster_idx = cluster_idx.detach().cpu().long()
 
             batch_size = img_cpu.size(0)
             if sim.dim() == 3:
@@ -688,6 +722,9 @@ def do_inference(cfg,
                     "image_key": image_key,
                     "branch_name": _get_spatial_branch_name(model),
                 }
+                if cluster_idx is not None:
+                    inference_visuals[image_key]["cluster_idx"] = cluster_idx[sample_idx].clone()
+                    inference_visuals[image_key]["cluster_num"] = int(cluster_num or cluster_idx.max().item() + 1)
             global_offset += batch_size
 
     h_tokens = model.module.h_resolution if hasattr(model, "module") else model.h_resolution
