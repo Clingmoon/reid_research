@@ -214,6 +214,43 @@ class VisionTransformer(nn.Module):
 
         self.ln_post = LayerNorm(width)
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
+        self.use_last_cls = False
+        self.last_cls_topk = 1
+        self.last_cls_eps = 1e-6
+
+    def gaussian_kernel_1d(self, kernel_size, sigma, device, dtype):
+        positions = torch.arange(
+            -kernel_size // 2 + 1,
+            kernel_size // 2 + 1,
+            device=device,
+            dtype=torch.float32,
+        )
+        kernel = torch.exp(-0.5 * (positions / sigma) ** 2)
+        kernel = kernel / torch.max(kernel)
+        return kernel.to(dtype=dtype)
+
+    def last_cls_token(self, x: torch.Tensor):
+        patch_tokens = x[:, 1:]
+        fft_tokens = patch_tokens.float()
+        kernel_size = fft_tokens.size(-1)
+        kernel = self.gaussian_kernel_1d(
+            kernel_size,
+            kernel_size ** 0.5,
+            fft_tokens.device,
+            fft_tokens.dtype,
+        ).view(1, 1, -1)
+
+        low_pass_tokens = torch.fft.fft(fft_tokens, dim=-1)
+        low_pass_tokens = torch.fft.fftshift(low_pass_tokens, dim=-1)
+        low_pass_tokens = low_pass_tokens * kernel
+        low_pass_tokens = torch.fft.ifftshift(low_pass_tokens, dim=-1)
+        low_pass_tokens = torch.fft.ifft(low_pass_tokens, dim=-1).real
+
+        diff = fft_tokens / torch.abs(low_pass_tokens - fft_tokens).clamp_min(self.last_cls_eps)
+        topk = min(self.last_cls_topk, patch_tokens.size(1))
+        _, indices = torch.topk(diff, k=topk, dim=1, largest=True)
+        selected_tokens = torch.gather(patch_tokens, 1, indices)
+        return torch.mean(selected_tokens, dim=1)
 
     def forward(self, x: torch.Tensor, cv_emb = None):
         x = self.conv1(x)  # shape = [*, width, grid, grid]
@@ -233,6 +270,18 @@ class VisionTransformer(nn.Module):
         x12 = x12.permute(1, 0, 2)  # LND -> NLD  
 
         x12 = self.ln_post(x12)  
+
+        if self.use_last_cls:
+            x12 = x12.clone()
+            # 1. 计算新的 LAST-ViT CLS token
+            new_cls = self.last_cls_token(x12) 
+            
+            # 2. 确保 new_cls 的维度是 (Batch, 1, Channels) 以便拼接
+            if new_cls.dim() == 2:
+                new_cls = new_cls.unsqueeze(1)
+            
+            # 3. 将新的 CLS token 与原有的 Patch tokens 拼接，生成全新的 x12 张量
+            x12 = torch.cat([new_cls, x12[:, 1:]], dim=1)
 
         if self.proj is not None:
             xproj = x12 @ self.proj   

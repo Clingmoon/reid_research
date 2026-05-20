@@ -26,6 +26,10 @@ _C.MODEL.LAST_STRIDE = 1
 # Path to pretrained model of backbone
 _C.MODEL.PRETRAIN_PATH = ''
 
+# LAST-ViT frequency-domain patch selection for replacing the final CLS token
+_C.MODEL.USE_LAST_CLS = False
+_C.MODEL.LAST_CLS_TOPK = 1
+
 # Use ImageNet pretrained model to initialize backbone or use self trained model to initialize the whole model
 # Options: 'imagenet' , 'self' , 'finetune'
 _C.MODEL.PRETRAIN_CHOICE = 'imagenet'
@@ -68,7 +72,7 @@ _C.MODEL.MEMORY_MOMENTUM = 0.2
 
 # CMIC content-adaptive cluster Mamba branch
 _C.MODEL.CAM_D_STATE = 16
-_C.MODEL.CAM_CLUSTER_NUM = 16
+_C.MODEL.CAM_CLUSTER_NUM = 2
 _C.MODEL.CAM_INNER_RANK = 128
 _C.MODEL.CAM_MLP_RATIO = 2.0
 _C.MODEL.CAM_N_ITER = 5

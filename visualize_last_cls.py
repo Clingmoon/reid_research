@@ -77,7 +77,8 @@ def visualize_last_vs_clip(img_path, last_weight_path, output_path,
     vit_orig = clip_orig.visual.cuda()
     vit_orig.eval()
 
-    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+    fig, axes = plt.subplots(2, 3, figsize=(16, 10))
+    fig.subplots_adjust(left=0.02, right=0.92, top=0.92, bottom=0.02, wspace=0.08, hspace=0.15)
     img_np = np.array(img.resize((w, h)))
     patch_h = h / h_tokens
     patch_w = w / w_tokens
@@ -104,7 +105,7 @@ def visualize_last_vs_clip(img_path, last_weight_path, output_path,
                                  extent=[0, w, h, 0])
         axes[0, 1].set_title('LAST Stability Scores (red=higher, selected)')
         axes[0, 1].axis('off')
-        plt.colorbar(im1, ax=axes[0, 1], fraction=0.046)
+        plt.colorbar(im1, ax=axes[0, 1], fraction=0.04, pad=0.02)
 
         # 3. LAST Top-10 选中的 patch
         topk_last = np.argsort(scores_last)[-10:]
@@ -138,7 +139,7 @@ def visualize_last_vs_clip(img_path, last_weight_path, output_path,
                                  extent=[0, w, h, 0])
         axes[1, 0].set_title('CLIP CLS-Patch Cosine Similarity')
         axes[1, 0].axis('off')
-        plt.colorbar(im2, ax=axes[1, 0], fraction=0.046)
+        plt.colorbar(im2, ax=axes[1, 0], fraction=0.04, pad=0.02)
 
         # 5. 原始 CLIP Top-10 相似 patch
         topk_sim = np.argsort(sim)[-10:]
@@ -159,7 +160,7 @@ def visualize_last_vs_clip(img_path, last_weight_path, output_path,
                                  extent=[0, w, h, 0], vmin=-1, vmax=1)
         axes[1, 2].set_title('Difference: LAST(red+) vs CLIP(blue+)')
         axes[1, 2].axis('off')
-        plt.colorbar(im3, ax=axes[1, 2], fraction=0.046)
+        plt.colorbar(im3, ax=axes[1, 2], fraction=0.04, pad=0.02)
 
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
@@ -169,12 +170,12 @@ def visualize_last_vs_clip(img_path, last_weight_path, output_path,
 
 if __name__ == '__main__':
     # Market-1501 测试图片
-    img_dir = '/home/cfdeng/projects/CLIMB-ReID/datasets/reid-datasets/Market1501/bounding_box_test'
-    img_name = sorted(os.listdir(img_dir))[0]  # 取第一张
-    img_path = os.path.join(img_dir, img_name)
-
+    img_path = '/home/cfdeng/projects/CLIMB-ReID/datasets/reid-datasets/Market1501/bounding_box_test/0001_c3s1_000551_03.jpg'
     last_weight_path = '/home/cfdeng/projects/CLIMB-ReID/config/openai_b_16.pt'
-    output_path = '/home/cfdeng/projects/CLIMB-ReID/last_cls_visualization.png'
+
+    from datetime import datetime
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    output_path = f'/home/cfdeng/projects/CLIMB-ReID/last_cls_visualization_{ts}.png'
 
     print(f'Visualizing: {img_path}')
     visualize_last_vs_clip(img_path, last_weight_path, output_path)

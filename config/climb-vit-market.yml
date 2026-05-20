@@ -1,5 +1,8 @@
 MODEL:
   NAME: 'ViT-B-16'
+  PRETRAIN_PATH: '/home/cfdeng/projects/CLIMB-ReID/config/openai_b_16.pt'
+  USE_LAST_CLS: False
+  LAST_CLS_TOPK: 1
   STRIDE_SIZE: [16, 16] # patch步长
   MEMORY_MOMENTUM: 0.2 # 记忆更新动量
   ID_LOSS_WEIGHT: 0.25

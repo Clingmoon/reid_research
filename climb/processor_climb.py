@@ -419,7 +419,6 @@ def train_climb(cfg,
             loss1 = memory(feat, target) * cfg.MODEL.PCL_LOSS_WEIGHT
             proxy_mean_ce = float(getattr(memory, "last_mean_ce", 0.0))
             proxy_hard_ce = float(getattr(memory, "last_hard_ce", 0.0))
-            # if cfg.MODEL.ID_LOSS_WEIGHT > 0:
             loss_id = xent(logits, target) * cfg.MODEL.ID_LOSS_WEIGHT
             loss_id2 = xent(logits_sp, target)
             loss_tri = tri_loss(feat_sp, target)
@@ -428,8 +427,6 @@ def train_climb(cfg,
             loss.backward()
             optimizer.step()
 
-            # scaler.step(optimizer)
-            # scaler.update()
             acc = (logits.max(1)[1] == target).float().mean()
             acc2 = (logits_sp.max(1)[1] == target).float().mean()
 

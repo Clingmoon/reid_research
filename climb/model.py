@@ -29,11 +29,26 @@ def weights_init_classifier(m):
             nn.init.constant_(m.bias, 0.0)
             
 import clip.clip as clip
-def load_clip_to_cpu(backbone_name, h_resolution, w_resolution, vision_stride_size):
+
+def extract_clip_state_dict(checkpoint):
+    if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+        checkpoint = checkpoint['state_dict']
+    if isinstance(checkpoint, dict):
+        checkpoint = {
+            key.replace('module.', '', 1): value
+            for key, value in checkpoint.items()
+        }
+    return checkpoint
+
+def load_clip_to_cpu(backbone_name, h_resolution, w_resolution, vision_stride_size, pretrained_path=''):
     url = clip._MODELS[backbone_name]
     model_path1 = '/dataset_cc/Pretrain-models/ViT-B-16.pt'  # 不用下载,用下载好的
     model_path2 = '/YCY/Pretrained_models/ViT-B-16.pt'  # 不用下载,用下载好的
-    if os.path.exists(model_path1):
+    if pretrained_path:
+        if not os.path.exists(pretrained_path):
+            raise FileNotFoundError('CLIP pretrained weight not found: {}'.format(pretrained_path))
+        model_path = pretrained_path
+    elif os.path.exists(model_path1):
         model_path = model_path1
     elif os.path.exists(model_path2):
         model_path = model_path2
@@ -45,9 +60,9 @@ def load_clip_to_cpu(backbone_name, h_resolution, w_resolution, vision_stride_si
         state_dict = None
 
     except RuntimeError:
-        state_dict = torch.load(model_path, map_location="cpu")
+        state_dict = extract_clip_state_dict(torch.load(model_path, map_location="cpu"))
 
-    model = clip.build_model(state_dict or model.state_dict(), h_resolution, w_resolution, vision_stride_size)
+    model = clip.build_model(extract_clip_state_dict(state_dict or model.state_dict()), h_resolution, w_resolution, vision_stride_size)
 
     return model
 
@@ -76,10 +91,21 @@ class CLIMB(nn.Module):
         self.h_resolution = int((cfg.INPUT.SIZE_TRAIN[0]-16)//cfg.MODEL.STRIDE_SIZE[0] + 1)
         self.w_resolution = int((cfg.INPUT.SIZE_TRAIN[1]-16)//cfg.MODEL.STRIDE_SIZE[1] + 1)
         self.vision_stride_size = cfg.MODEL.STRIDE_SIZE[0]
-        clip_model = load_clip_to_cpu(self.model_name, self.h_resolution, self.w_resolution, self.vision_stride_size)
+        pretrained_path = cfg.MODEL.PRETRAIN_PATH if cfg.MODEL.USE_LAST_CLS else ''
+        clip_model = load_clip_to_cpu(
+            self.model_name,
+            self.h_resolution,
+            self.w_resolution,
+            self.vision_stride_size,
+            pretrained_path,
+        )
         clip_model.to("cuda")
 
         self.image_encoder = clip_model.visual
+        self.image_encoder.use_last_cls = cfg.MODEL.USE_LAST_CLS
+        self.image_encoder.last_cls_topk = cfg.MODEL.LAST_CLS_TOPK
+        if cfg.MODEL.USE_LAST_CLS:
+            print('Using LAST-ViT frequency-domain CLS selection with topk={}'.format(cfg.MODEL.LAST_CLS_TOPK))
         
         # Trick: freeze patch projection for improved stability
         # https://arxiv.org/pdf/2104.02057.pdf
