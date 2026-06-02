@@ -4,6 +4,7 @@ MODEL:
   MEMORY_MOMENTUM: 0.2 # 记忆更新动量
   ID_LOSS_WEIGHT: 0.25
   PCL_LOSS_WEIGHT: 1.0 # 记忆对比损失
+  USE_OCCLUSION_MASK: True
   # SIE_CAMERA: True
   # SIE_COE : 1.0
 
@@ -42,8 +43,9 @@ TEST:
   EVAL: True
   IMS_PER_BATCH: 256
   RE_RANKING: False
+  VISUALIZE_EPOCHS: [60]
 
 DATASETS:
   NAMES: ('market1501')
   ROOT_DIR: ('/home/cfdeng/projects/CLIMB-ReID/datasets/reid-datasets')
-OUTPUT_DIR: './logs'
+OUTPUT_DIR: './logs_market_vit_occlusion_mask'

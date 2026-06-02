@@ -9,6 +9,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 import torch
+from torch.cuda import amp
 from torch.utils.data import DataLoader, Subset
 import torch.nn.functional as F
 import torch.nn as nn
@@ -52,7 +53,13 @@ def _save_comparison_visuals(samples, output_dir, file_prefix, h_tokens, w_token
         img_np = img_denorm.permute(1, 2, 0).numpy()
         img_h, img_w = img_np.shape[:2]
 
-        sim_map = sample["sim"].view(1, 1, h_tokens, w_tokens)
+        # 使用原始相似度作为热力图基础
+        sim_raw = sample.get("sim_raw")
+        sim = sample["sim"]
+        if sim_raw is not None:
+            sim_map = sim_raw.view(1, 1, h_tokens, w_tokens)
+        else:
+            sim_map = sim.view(1, 1, h_tokens, w_tokens)
         sim_map = F.interpolate(sim_map, size=(img_h, img_w), mode="bilinear", align_corners=False)
         sim_map = sim_map.squeeze().numpy()
 
@@ -60,22 +67,59 @@ def _save_comparison_visuals(samples, output_dir, file_prefix, h_tokens, w_token
         attn_map = F.interpolate(attn_map, size=(img_h, img_w), mode="bilinear", align_corners=False)
         attn_map = attn_map.squeeze().numpy()
 
-        fig, axes = plt.subplots(1, 4, figsize=(20, 5), gridspec_kw={"wspace": 0.1})
+        fig, axes = plt.subplots(1, 5, figsize=(25, 5), gridspec_kw={"wspace": 0.1})
 
+        # (a) Original Input
         axes[0].imshow(img_np)
         axes[0].set_title("(a) Original Input")
         axes[0].axis("off")
 
+        # (b) CLIP Initial Similarity (基于原始 cosine similarity)
         axes[1].imshow(img_np)
         axes[1].imshow(sim_map, cmap="jet", alpha=0.45)
         axes[1].set_title("(b) CLIP Initial Similarity")
         axes[1].axis("off")
 
-        axes[2].imshow(img_np)
+        # 计算原始排序索引
+        if sim_raw is not None:
+            _, indices_raw = torch.sort(sim_raw, descending=True)
+        else:
+            indices_raw = sample["indices"]
+
         patch_h = img_h / float(h_tokens)
         patch_w = img_w / float(w_tokens)
-        topk = min(10, sample["indices"].numel())
-        for rank_idx, patch_idx in enumerate(sample["indices"][:topk].tolist(), start=1):
+
+        # (c) Original Reorder Top-10 (绿色框)
+        axes[2].imshow(img_np)
+        topk = min(10, indices_raw.numel())
+        for rank_idx, patch_idx in enumerate(indices_raw[:topk].tolist(), start=1):
+            row = patch_idx // w_tokens
+            col = patch_idx % w_tokens
+            rect = Rectangle(
+                (col * patch_w, row * patch_h),
+                patch_w,
+                patch_h,
+                fill=False,
+                edgecolor="green",
+                linewidth=2,
+            )
+            axes[2].add_patch(rect)
+            axes[2].text(
+                col * patch_w + 2,
+                row * patch_h + 14,
+                str(rank_idx),
+                color="white",
+                fontsize=10,
+                bbox=dict(facecolor="green", edgecolor="green", pad=1.0),
+            )
+        axes[2].set_title("(c) Original Reorder (Top-10)")
+        axes[2].axis("off")
+
+        # (d) Occlusion-Calibrated Reorder Top-10 (红色框) + w_t 热力图叠加
+        axes[3].imshow(img_np)
+        indices = sample["indices"]
+        topk = min(10, indices.numel())
+        for rank_idx, patch_idx in enumerate(indices[:topk].tolist(), start=1):
             row = patch_idx // w_tokens
             col = patch_idx % w_tokens
             rect = Rectangle(
@@ -86,8 +130,8 @@ def _save_comparison_visuals(samples, output_dir, file_prefix, h_tokens, w_token
                 edgecolor="red",
                 linewidth=2,
             )
-            axes[2].add_patch(rect)
-            axes[2].text(
+            axes[3].add_patch(rect)
+            axes[3].text(
                 col * patch_w + 2,
                 row * patch_h + 14,
                 str(rank_idx),
@@ -95,13 +139,21 @@ def _save_comparison_visuals(samples, output_dir, file_prefix, h_tokens, w_token
                 fontsize=10,
                 bbox=dict(facecolor="red", edgecolor="red", pad=1.0),
             )
-        axes[2].set_title("(c) Patch Reordering (Top-10)")
-        axes[2].axis("off")
-
-        axes[3].imshow(img_np)
-        axes[3].imshow(attn_map, cmap="jet", alpha=0.45)
-        axes[3].set_title("(d) BiMamba Final Attention")
+        # 叠加 w_t 权重热力图：低权重(遮挡)偏蓝，高权重(人体)偏红
+        w_t = sample.get("w_t")
+        if w_t is not None:
+            w_t_map = w_t.view(1, 1, h_tokens, w_tokens)
+            w_t_map = F.interpolate(w_t_map, size=(img_h, img_w), mode="bilinear", align_corners=False)
+            w_t_map = w_t_map.squeeze().numpy()
+            axes[3].imshow(w_t_map, cmap="coolwarm", alpha=0.35, vmin=0.0, vmax=1.0)
+        axes[3].set_title("(d) Occlusion-Calibrated (Top-10)")
         axes[3].axis("off")
+
+        # (e) BiMamba Final Attention
+        axes[4].imshow(img_np)
+        axes[4].imshow(attn_map, cmap="jet", alpha=0.45)
+        axes[4].set_title("(e) BiMamba Final Attention")
+        axes[4].axis("off")
 
         plt.tight_layout(pad=0.6, w_pad=0.4)
         save_name = _build_visual_filename(sample, image_key, file_prefix=file_prefix)
@@ -326,7 +378,7 @@ def train_climb(cfg,
         feat_norm=cfg.TEST.FEAT_NORM,
         reranking=cfg.TEST.RE_RANKING,
     )
-    # scaler = amp.GradScaler()
+    scaler = amp.GradScaler()
     best_performance = 0
     best_epoch = 1
     visualize_epochs = _resolve_visualize_epochs(cfg)
@@ -364,39 +416,41 @@ def train_climb(cfg,
         model.train()
         num_iters = len(train_loader)
         for n_iter in range(num_iters):
-            img, target, target_cam, _ = train_loader.next()
-            
+            batch = train_loader.next()
+            if len(batch) == 4:
+                img, target, target_cam, _ = batch
+                target_view = None
+            else:
+                img, target, target_cam, target_view = batch
+
             optimizer.zero_grad()
-            
+
             img = img.to(device)
             target = target.to(device)
-            target_cam = target_cam.to(device)
-            
+
             if cfg.MODEL.SIE_CAMERA:
                 target_cam = target_cam.to(device)
-            else: 
+            else:
                 target_cam = None
-            if cfg.MODEL.SIE_VIEW:
+            if cfg.MODEL.SIE_VIEW and target_view is not None:
                 target_view = target_view.to(device)
-            else: 
+            else:
                 target_view = None
                 
-            # with amp.autocast(enabled=True):
-            feat, logits, feat_sp, logits_sp = model(img, cam_label=target_cam, view_label=target_view)
-            loss1 = memory(feat, target) * cfg.MODEL.PCL_LOSS_WEIGHT
-            proxy_mean_ce = float(getattr(memory, "last_mean_ce", 0.0))
-            proxy_hard_ce = float(getattr(memory, "last_hard_ce", 0.0))
-            # if cfg.MODEL.ID_LOSS_WEIGHT > 0:
-            loss_id = xent(logits, target) * cfg.MODEL.ID_LOSS_WEIGHT
-            loss_id2 = xent(logits_sp, target)
-            loss_tri = tri_loss(feat_sp, target)
-            loss = loss1 + loss_id + loss_id2 + loss_tri
+            with amp.autocast(enabled=True):
+                feat, logits, feat_sp, logits_sp = model(img, cam_label=target_cam, view_label=target_view)
+                loss1 = memory(feat, target) * cfg.MODEL.PCL_LOSS_WEIGHT
+                proxy_mean_ce = float(getattr(memory, "last_mean_ce", 0.0))
+                proxy_hard_ce = float(getattr(memory, "last_hard_ce", 0.0))
+                # if cfg.MODEL.ID_LOSS_WEIGHT > 0:
+                loss_id = xent(logits, target) * cfg.MODEL.ID_LOSS_WEIGHT
+                loss_id2 = xent(logits_sp, target)
+                loss_tri = tri_loss(feat_sp, target)
+                loss = loss1 + loss_id + loss_id2 + loss_tri
 
-            loss.backward()
-            optimizer.step()
-
-            # scaler.step(optimizer)
-            # scaler.update()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             acc = (logits.max(1)[1] == target).float().mean()
             acc2 = (logits_sp.max(1)[1] == target).float().mean()
 
@@ -439,7 +493,8 @@ def train_climb(cfg,
         scheduler.step()
         logger.info("Epoch {} done.".format(epoch))
 
-        should_eval = (epoch % eval_period == 0 and epoch >= 55) or (epoch in visualize_epochs)
+        eval_start_epoch = getattr(cfg.SOLVER, 'EVAL_START_EPOCH', 1)
+        should_eval = (epoch % eval_period == 0 and epoch >= eval_start_epoch) or (epoch in visualize_epochs)
         if should_eval:
             model.eval()
             evaluator = R1_mAP_eval(
@@ -461,9 +516,19 @@ def train_climb(cfg,
                 with torch.no_grad():
                     img, vid, camid, camids_batch, target_view, img_paths = _unpack_eval_batch(batch)
 
+                    # Handle dense sampling for video: (B, N, T, C, H, W) -> (B*N, T, C, H, W)
+                    if len(img.shape) == 6:
+                        b, n, t, c, h, w = img.shape
+                        assert b == 1
+                        img = img.view(b * n, t, c, h, w)
+                        if camids_batch is not None:
+                            camids_batch = camids_batch.repeat(n)
+                        if target_view is not None:
+                            target_view = target_view.repeat(n)
+
                     img = img.to(device)
                     if cfg.MODEL.SIE_CAMERA:
-                        camids = camids_batch.to(device)
+                        camids = camids_batch.to(device) if camids_batch is not None else None
                     else:
                         camids = None
                     if cfg.MODEL.SIE_VIEW and target_view is not None:
@@ -472,6 +537,13 @@ def train_climb(cfg,
                         target_view = None
 
                     feat, feat1, feat2 = model(img, cam_label=camids, view_label=target_view)
+
+                    # For dense sampling, average features over clips
+                    if len(batch[0].shape) == 6:
+                        feat = feat.view(n, -1).mean(0, keepdim=True)
+                        feat1 = feat1.view(n, -1).mean(0, keepdim=True)
+                        feat2 = feat2.view(n, -1).mean(0, keepdim=True)
+
                     evaluator.update((feat, feat1, feat2, vid, camid))
 
                     if visualize_this_epoch and img_paths is not None:
@@ -507,10 +579,14 @@ def train_climb(cfg,
                             if not any(image_key in selected_keys for image_key in batch_keys):
                                 continue
 
+                            # Skip dense video for visualization (too complex)
+                            if len(img.shape) == 6:
+                                continue
+
                             img_cpu = img.detach().cpu()
                             img = img.to(device)
                             if cfg.MODEL.SIE_CAMERA:
-                                camids = camids_batch.to(device)
+                                camids = camids_batch.to(device) if camids_batch is not None else None
                             else:
                                 camids = None
                             if cfg.MODEL.SIE_VIEW and target_view is not None:
@@ -528,15 +604,25 @@ def train_climb(cfg,
                             sim = visual_tensors["sim"].detach().cpu()
                             indices = visual_tensors["indices"].detach().cpu().long()
                             attn_weights = visual_tensors["attn_weights"].detach().cpu()
+                            sim_raw = visual_tensors.get("sim_raw")
+                            w_t = visual_tensors.get("w_t")
+                            if sim_raw is not None:
+                                sim_raw = sim_raw.detach().cpu()
+                            if w_t is not None:
+                                w_t = w_t.detach().cpu()
                             batch_size = img_cpu.size(0)
                             if sim.dim() == 3:
                                 sim = sim.squeeze(1)
+                            if sim_raw is not None and sim_raw.dim() == 3:
+                                sim_raw = sim_raw.squeeze(1)
+                            if w_t is not None and w_t.dim() == 3:
+                                w_t = w_t.squeeze(1)
                             restored_attn = _resolve_attention_map(attn_weights, indices, batch_size, logger=logger, tag=f"epoch{epoch}")
 
                             for sample_idx, image_key in enumerate(batch_keys):
                                 if image_key not in selected_targets or image_key in epoch_visuals:
                                     continue
-                                epoch_visuals[image_key] = {
+                                vis_entry = {
                                     "img": img_cpu[sample_idx].clone(),
                                     "sim": sim[sample_idx].clone(),
                                     "indices": indices[sample_idx].clone(),
@@ -547,6 +633,11 @@ def train_climb(cfg,
                                     "image_key": image_key,
                                     "reason": selected_targets[image_key]["reason"],
                                 }
+                                if sim_raw is not None:
+                                    vis_entry["sim_raw"] = sim_raw[sample_idx].clone()
+                                if w_t is not None:
+                                    vis_entry["w_t"] = w_t[sample_idx].clone()
+                                epoch_visuals[image_key] = vis_entry
 
                             if len(epoch_visuals) == len(selected_targets):
                                 break
@@ -621,9 +712,21 @@ def do_inference(cfg,
         with torch.no_grad():
             img, pid, camid, camids_batch, target_view, img_paths = _unpack_eval_batch(batch)
             img_cpu = img.detach().cpu()
+
+            # Handle dense sampling for video: (B, N, T, C, H, W) -> (B*N, T, C, H, W)
+            is_dense_video = len(img.shape) == 6
+            if is_dense_video:
+                b, n, t, c, h, w = img.shape
+                assert b == 1
+                img = img.view(b * n, t, c, h, w)
+                if camids_batch is not None:
+                    camids_batch = camids_batch.repeat(n)
+                if target_view is not None:
+                    target_view = target_view.repeat(n)
+
             img = img.to(device)
             if cfg.MODEL.SIE_CAMERA:
-                camids = camids_batch.to(device)
+                camids = camids_batch.to(device) if camids_batch is not None else None
             else:
                 camids = None
             if cfg.MODEL.SIE_VIEW and target_view is not None:
@@ -631,7 +734,7 @@ def do_inference(cfg,
             else:
                 target_view = None
 
-            if need_visuals:
+            if need_visuals and not is_dense_video:
                 feat, feat0, feat1, visual_tensors = model(
                     img,
                     cam_label=camids,
@@ -646,19 +749,35 @@ def do_inference(cfg,
                 )
                 visual_tensors = None
 
+            # For dense sampling, average features over clips
+            if is_dense_video:
+                feat = feat.view(n, -1).mean(0, keepdim=True)
+                feat0 = feat0.view(n, -1).mean(0, keepdim=True)
+                feat1 = feat1.view(n, -1).mean(0, keepdim=True)
+
             if evaluator is not None:
                 evaluator.update((feat, feat0, feat1, pid, camid))
 
-            if not need_visuals or visual_tensors is None:
+            if not need_visuals or visual_tensors is None or is_dense_video:
                 continue
 
             sim = visual_tensors["sim"].detach().cpu()
             indices = visual_tensors["indices"].detach().cpu().long()
             attn_weights = visual_tensors["attn_weights"].detach().cpu()
+            sim_raw = visual_tensors.get("sim_raw")
+            w_t = visual_tensors.get("w_t")
+            if sim_raw is not None:
+                sim_raw = sim_raw.detach().cpu()
+            if w_t is not None:
+                w_t = w_t.detach().cpu()
 
             batch_size = img_cpu.size(0)
             if sim.dim() == 3:
                 sim = sim.squeeze(1)
+            if sim_raw is not None and sim_raw.dim() == 3:
+                sim_raw = sim_raw.squeeze(1)
+            if w_t is not None and w_t.dim() == 3:
+                w_t = w_t.squeeze(1)
             restored_attn = _resolve_attention_map(attn_weights, indices, batch_size, logger=logger, tag="inference")
 
             for sample_idx in range(batch_size):
@@ -666,7 +785,7 @@ def do_inference(cfg,
                 image_key = img_paths[sample_idx] if img_paths is not None else f"sample_{original_index:05d}"
                 pid_value = int(np.asarray(pid)[sample_idx])
                 camid_value = int(np.asarray(camid)[sample_idx])
-                inference_visuals[image_key] = {
+                vis_entry = {
                     "img": img_cpu[sample_idx].clone(),
                     "sim": sim[sample_idx].clone(),
                     "indices": indices[sample_idx].clone(),
@@ -675,6 +794,11 @@ def do_inference(cfg,
                     "camid": camid_value,
                     "image_key": image_key,
                 }
+                if sim_raw is not None:
+                    vis_entry["sim_raw"] = sim_raw[sample_idx].clone()
+                if w_t is not None:
+                    vis_entry["w_t"] = w_t[sample_idx].clone()
+                inference_visuals[image_key] = vis_entry
             global_offset += batch_size
 
     h_tokens = model.module.h_resolution if hasattr(model, "module") else model.h_resolution
