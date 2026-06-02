@@ -26,7 +26,7 @@ class CM(autograd.Function):
         inputs, targets = ctx.saved_tensors
         grad_inputs = None
         if ctx.needs_input_grad[0]:
-            grad_inputs = grad_outputs.mm(ctx.features)
+            grad_inputs = grad_outputs.float().mm(ctx.features)
 
         # momentum update
         for x, y in zip(inputs, targets):
@@ -56,7 +56,7 @@ class CM_Hard(autograd.Function):
         inputs, targets = ctx.saved_tensors
         grad_inputs = None
         if ctx.needs_input_grad[0]:
-            grad_inputs = grad_outputs.mm(ctx.features)
+            grad_inputs = grad_outputs.float().mm(ctx.features)
 
         batch_centers = collections.defaultdict(list)
         for instance_feature, index in zip(inputs, targets.tolist()):
@@ -92,7 +92,7 @@ class CM_Mix_mean_hard(autograd.Function):
         nums = len(ctx.features)//2
         grad_inputs = None
         if ctx.needs_input_grad[0]:
-            grad_inputs = grad_outputs.mm(ctx.features)
+            grad_inputs = grad_outputs.float().mm(ctx.features)
         for x, y in zip(inputs, indexes):
             ctx.features[y] = ctx.momentum * ctx.features[y] + (1. - ctx.momentum) * x
             ctx.features[y] /= ctx.features[y].norm()

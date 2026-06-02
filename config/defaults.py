@@ -66,6 +66,9 @@ _C.MODEL.PCL_LOSS_WEIGHT = 1.0
 # memory bank
 _C.MODEL.MEMORY_MOMENTUM = 0.2
 
+# Occlusion mask attention in IRM reordering
+_C.MODEL.USE_OCCLUSION_MASK = False
+
 # -----------------------------------------------------------------------------
 # INPUT
 # -----------------------------------------------------------------------------
@@ -84,6 +87,8 @@ _C.INPUT.PIXEL_MEAN = [0.485, 0.456, 0.406]
 _C.INPUT.PIXEL_STD = [0.229, 0.224, 0.225]
 # Value of padding size
 _C.INPUT.PADDING = 10
+# Sequence length for video datasets
+_C.INPUT.SEQ_LEN = 8
 
 # -----------------------------------------------------------------------------
 # Dataset
@@ -93,6 +98,8 @@ _C.DATASETS = CN()
 _C.DATASETS.NAMES = ('market1501')
 # Root directory where datasets should be used (and downloaded if not found)
 _C.DATASETS.ROOT_DIR = ('/home/cfdeng/projects/CLIMB-ReID/datasets/reid-datasets')
+# Split id for video datasets (iLIDS-VID has 10 splits 0-9)
+_C.DATASETS.SPLIT = 0
 
 _C.DATASETS.ATTR_PATH = ''
 _C.DATASETS.ATTR_NUM = 30
@@ -165,6 +172,7 @@ _C.SOLVER.CHECKPOINT_PERIOD = 10
 _C.SOLVER.LOG_PERIOD = 100
 # epoch number of validation
 _C.SOLVER.EVAL_PERIOD = 10
+_C.SOLVER.EVAL_START_EPOCH = 1
 
 # iters per epoch
 _C.SOLVER.ITERS = 200
