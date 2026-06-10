@@ -214,7 +214,7 @@ class CLIMB(nn.Module):
             return selected_patch_embedding, cls_attn, indices
         return selected_patch_embedding
 
-    def forward(self, x, get_image = False, cam_label= None, view_label=None, return_visuals=False):
+    def forward(self, x, get_image = False, cam_label= None, view_label=None, return_visuals=False, get_mamba=False):
         if get_image == True:
             if hasattr(self, "cv_embed") and cam_label != None and view_label!=None:
                 cv_embed = self.sie_coe * self.cv_embed[cam_label * self.view_num + view_label]
@@ -224,7 +224,13 @@ class CLIMB(nn.Module):
                 cv_embed = self.sie_coe * self.cv_embed[view_label]
             else:
                 cv_embed = None
-            _, image_features, image_features_proj = self.image_encoder(x, cv_embed)
+            need_attn = get_mamba and self.use_attention_reorder
+            if need_attn:
+                encoder_out = self.image_encoder(x, cv_embed, return_attn=True)
+                image_features, image_features_proj, attn_weights = encoder_out[1], encoder_out[2], encoder_out[3]
+            else:
+                _, image_features, image_features_proj = self.image_encoder(x, cv_embed)
+                attn_weights = None
             img_feature = image_features[:,0]
             img_feature_proj = image_features_proj[:,0]
 
@@ -232,6 +238,24 @@ class CLIMB(nn.Module):
             feat_proj = self.bottleneck_proj(img_feature_proj)
 
             out_feat = torch.cat([feat, feat_proj], dim=1)
+            if get_mamba:
+                feats_for_mamba = image_features.detach()
+                feats_for_mamba_sp = feats_for_mamba[:, 1:, :].detach()
+                feats_for_mamba_cls = feats_for_mamba[:, 0, :].detach()
+                if self.use_attention_reorder and attn_weights is not None:
+                    re_order_mamba_sp = self.reorder_by_attention(attn_weights, feats_for_mamba_sp, top_k=self.mamba_top_k)
+                else:
+                    re_order_mamba_sp = self.reorder(feats_for_mamba_cls, feats_for_mamba_sp, top_k=self.mamba_top_k)
+                mamba_sp_out = self.sp_mamba_bi(re_order_mamba_sp)
+                mamba_sp_out = torch.cat((feats_for_mamba_cls.unsqueeze(1), mamba_sp_out), dim=1)
+                mamba_sp_out2 = self.norm2_mamba(mamba_sp_out)
+                A = self.sp_attention(mamba_sp_out2)
+                A = torch.transpose(A, 1, 2)
+                A = F.softmax(A, dim=-1)
+                mamba_sp_out2 = torch.bmm(A, mamba_sp_out2)
+                mamba_sp_out2 = mamba_sp_out2.squeeze(1)
+                feat_sp = self.bottleneck_proj_sp(mamba_sp_out2)
+                return out_feat, feat_sp
             return out_feat
 
         if hasattr(self, "cv_embed") and cam_label != None and view_label != None:

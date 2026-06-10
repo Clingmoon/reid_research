@@ -375,6 +375,7 @@ def train_climb(cfg,
     loss_meter2 = AverageMeter()
     loss_meter3 = AverageMeter()
     loss_meter4 = AverageMeter()
+    loss_mamba_memory_meter = AverageMeter()
     loss_proxy_mean_meter = AverageMeter()
     loss_proxy_hard_meter = AverageMeter()
     acc_meter = AverageMeter()
@@ -401,6 +402,7 @@ def train_climb(cfg,
         loss_meter2.reset()
         loss_meter3.reset()
         loss_meter4.reset()
+        loss_mamba_memory_meter.reset()
         loss_proxy_mean_meter.reset()
         loss_proxy_hard_meter.reset()
         acc_meter.reset()
@@ -409,7 +411,15 @@ def train_climb(cfg,
         evaluator.reset()
 
         # create memory bank
-        image_features, gt_labels = extract_image_features(model, cluster_loader, use_amp=True)
+        use_mamba_memory = cfg.MODEL.MAMBA_PCL_LOSS_WEIGHT > 0
+        if use_mamba_memory:
+            image_features, mamba_features, gt_labels = extract_image_features(
+                model, cluster_loader, use_amp=True, return_mamba=True
+            )
+            mamba_features = mamba_features.float()
+            mamba_features = F.normalize(mamba_features, dim=1)
+        else:
+            image_features, gt_labels = extract_image_features(model, cluster_loader, use_amp=True)
         image_features = image_features.float()
         image_features = F.normalize(image_features, dim=1)
             
@@ -422,6 +432,12 @@ def train_climb(cfg,
         memory = ClusterMemoryAMP(momentum=cfg.MODEL.MEMORY_MOMENTUM, use_hard=True).to(device)
         memory.features = compute_cluster_centroids(image_features, gt_labels).to(device)
         logger.info('Create memory bank with shape = {}'.format(memory.features.shape))
+
+        memory_sp = None
+        if use_mamba_memory:
+            memory_sp = ClusterMemoryAMP(momentum=cfg.MODEL.MEMORY_MOMENTUM, use_hard=True).to(device)
+            memory_sp.features = compute_cluster_centroids(mamba_features, gt_labels).to(device)
+            logger.info('Create Mamba memory bank with shape = {}'.format(memory_sp.features.shape))
         
         # train one iteration
         model.train()
@@ -449,11 +465,15 @@ def train_climb(cfg,
             loss1 = memory(feat, target) * cfg.MODEL.PCL_LOSS_WEIGHT
             proxy_mean_ce = float(getattr(memory, "last_mean_ce", 0.0))
             proxy_hard_ce = float(getattr(memory, "last_hard_ce", 0.0))
+            if memory_sp is not None:
+                loss_mamba_memory = memory_sp(feat_sp, target) * cfg.MODEL.MAMBA_PCL_LOSS_WEIGHT
+            else:
+                loss_mamba_memory = feat_sp.new_tensor(0.0)
             # if cfg.MODEL.ID_LOSS_WEIGHT > 0:
             loss_id = xent(logits, target) * cfg.MODEL.ID_LOSS_WEIGHT
             loss_id2 = xent(logits_sp, target)
             loss_tri = tri_loss(feat_sp, target)
-            loss = loss1 + loss_id + loss_id2 + loss_tri
+            loss = loss1 + loss_mamba_memory + loss_id + loss_id2 + loss_tri
 
             loss.backward()
             optimizer.step()
@@ -468,6 +488,7 @@ def train_climb(cfg,
             loss_meter2.update(loss_id.item(), img.shape[0])
             loss_meter3.update(loss_id2.item(), img.shape[0])
             loss_meter4.update(loss_tri.item(), img.shape[0])
+            loss_mamba_memory_meter.update(loss_mamba_memory.item(), img.shape[0])
             loss_proxy_mean_meter.update(proxy_mean_ce, img.shape[0])
             loss_proxy_hard_meter.update(proxy_hard_ce, img.shape[0])
             acc_meter.update(acc, 1)
@@ -482,6 +503,7 @@ def train_climb(cfg,
                             "Loss2: {:.3f}, "
                             "Loss3: {:.3f}, "
                             "Loss4: {:.3f}, "
+                            "MambaMemory: {:.3f}, "
                             "ProxyMeanCE: {:.3f}, "
                             "ProxyHardCE: {:.3f}, "
                             "acc1: {:.3f},"
@@ -493,6 +515,7 @@ def train_climb(cfg,
                                     loss_meter2.avg,
                                     loss_meter3.avg,
                                     loss_meter4.avg,
+                                    loss_mamba_memory_meter.avg,
                                     loss_proxy_mean_meter.avg,
                                     loss_proxy_hard_meter.avg,
                                     acc_meter.avg,

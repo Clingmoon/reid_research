@@ -4,6 +4,7 @@ MODEL:
   MEMORY_MOMENTUM: 0.2 # 记忆更新动量
   ID_LOSS_WEIGHT: 0.25
   PCL_LOSS_WEIGHT: 1.0 # 记忆对比损失
+  MAMBA_PCL_LOSS_WEIGHT: 0.1 # Ablation B: Mamba分支memory/prototype对比损失权重，0表示关闭
   USE_ATTENTION_REORDER: True  # 使用CLIP最后一层attention指导patch重排序
   MAMBA_TOP_K: 128            # 只取Top-K个patch进入Mamba（<=128）
   ATTENTION_REORDER_SOFT_GATE: True  # Ablation A: attention排序token与原始顺序token做soft gate残差融合

@@ -48,8 +48,9 @@ def pk_sampling(batchsize, k, pseudo_labels, samples):
     return iter(final_idxs)
 
 
-def extract_image_features(model, cluster_loader, use_amp=False):
+def extract_image_features(model, cluster_loader, use_amp=False, return_mamba=False):
     image_features = []
+    mamba_features = []
     labels = []
     
     model.eval()
@@ -59,12 +60,20 @@ def extract_image_features(model, cluster_loader, use_amp=False):
             target = pid.cuda()
             camid = camid.cuda()
             # with amp.autocast(enabled=use_amp):
-            image_feature = model(img, get_image = True,cam_label= camid)
-            for i, img_feat in zip(target, image_feature):
+            image_feature = model(img, get_image=True, cam_label=camid, get_mamba=return_mamba)
+            if return_mamba:
+                image_feature, mamba_feature = image_feature
+            for idx, img_feat in enumerate(image_feature):
+                i = target[idx]
                 labels.append(i)
                 image_features.append(img_feat.cpu())
+                if return_mamba:
+                    mamba_features.append(mamba_feature[idx].cpu())
     labels_list = torch.stack(labels, dim=0).cuda()
     image_features_list = torch.stack(image_features, dim=0).cuda() # NC
+    if return_mamba:
+        mamba_features_list = torch.stack(mamba_features, dim=0).cuda()
+        return image_features_list, mamba_features_list, labels_list
     return image_features_list, labels_list
 
 
