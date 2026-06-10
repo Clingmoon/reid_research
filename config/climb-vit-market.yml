@@ -4,6 +4,8 @@ MODEL:
   MEMORY_MOMENTUM: 0.2 # 记忆更新动量
   ID_LOSS_WEIGHT: 0.25
   PCL_LOSS_WEIGHT: 1.0 # 记忆对比损失
+  USE_ATTENTION_REORDER: True  # 使用CLIP最后一层attention指导patch重排序
+  MAMBA_TOP_K: 128            # 只取Top-K个patch进入Mamba（<=128）
   # SIE_CAMERA: True
   # SIE_COE : 1.0
 
@@ -29,7 +31,7 @@ SOLVER:
   WARMUP_ITERS: 10
   WARMUP_FACTOR: 0.1
   WEIGHT_DECAY: 5.0e-4
-  MAX_EPOCHS: 60 # 总轮次
+  MAX_EPOCHS: 70 # 总轮次
   CHECKPOINT_PERIOD: 60
   LOG_PERIOD: 50
   EVAL_PERIOD: 60

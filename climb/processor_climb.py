@@ -38,7 +38,12 @@ def _resolve_attention_map(attn_weights, indices, batch_size, logger=None, tag=N
                 )
             attn_weights = attn_weights[:, :num_patches]
 
-    restored_attn = torch.zeros_like(attn_weights)
+    # restored_attn must cover all original patch positions (128) so that
+    # scatter_ with raw patch indices (0..127) never goes out of bounds.
+    num_total_patches = int(indices.max().item()) + 1
+    restored_attn = torch.zeros(
+        batch_size, num_total_patches, device=attn_weights.device, dtype=attn_weights.dtype
+    )
     restored_attn.scatter_(1, indices, attn_weights)
     return restored_attn
 
@@ -51,57 +56,115 @@ def _save_comparison_visuals(samples, output_dir, file_prefix, h_tokens, w_token
         img_denorm = img_denorm.clamp(0.0, 1.0)
         img_np = img_denorm.permute(1, 2, 0).numpy()
         img_h, img_w = img_np.shape[:2]
+        patch_h = img_h / float(h_tokens)
+        patch_w = img_w / float(w_tokens)
 
-        sim_map = sample["sim"].view(1, 1, h_tokens, w_tokens)
-        sim_map = F.interpolate(sim_map, size=(img_h, img_w), mode="bilinear", align_corners=False)
-        sim_map = sim_map.squeeze().numpy()
+        has_attention_reorder = "indices_raw" in sample
+        ncols = 5 if has_attention_reorder else 4
+        fig, axes = plt.subplots(1, ncols, figsize=(5 * ncols, 5), gridspec_kw={"wspace": 0.1})
+        if ncols == 4:
+            axes = list(axes)
 
-        attn_map = sample["restored_attn"].view(1, 1, h_tokens, w_tokens)
-        attn_map = F.interpolate(attn_map, size=(img_h, img_w), mode="bilinear", align_corners=False)
-        attn_map = attn_map.squeeze().numpy()
-
-        fig, axes = plt.subplots(1, 4, figsize=(20, 5), gridspec_kw={"wspace": 0.1})
-
+        # (a) Original Input
         axes[0].imshow(img_np)
         axes[0].set_title("(a) Original Input")
         axes[0].axis("off")
 
-        axes[1].imshow(img_np)
-        axes[1].imshow(sim_map, cmap="jet", alpha=0.45)
-        axes[1].set_title("(b) CLIP Initial Similarity")
-        axes[1].axis("off")
+        if has_attention_reorder:
+            # (b) Original Similarity Reorder (Top-10) - green boxes
+            axes[1].imshow(img_np)
+            indices_raw = sample["indices_raw"]
+            topk = min(10, indices_raw.numel())
+            for rank_idx, patch_idx in enumerate(indices_raw[:topk].tolist(), start=1):
+                row = patch_idx // w_tokens
+                col = patch_idx % w_tokens
+                rect = Rectangle(
+                    (col * patch_w, row * patch_h), patch_w, patch_h,
+                    fill=False, edgecolor="green", linewidth=2,
+                )
+                axes[1].add_patch(rect)
+                axes[1].text(
+                    col * patch_w + 2, row * patch_h + 14, str(rank_idx),
+                    color="white", fontsize=10,
+                    bbox=dict(facecolor="green", edgecolor="green", pad=1.0),
+                )
+            axes[1].set_title("(b) Similarity Reorder (Top-10)")
+            axes[1].axis("off")
 
-        axes[2].imshow(img_np)
-        patch_h = img_h / float(h_tokens)
-        patch_w = img_w / float(w_tokens)
-        topk = min(10, sample["indices"].numel())
-        for rank_idx, patch_idx in enumerate(sample["indices"][:topk].tolist(), start=1):
-            row = patch_idx // w_tokens
-            col = patch_idx % w_tokens
-            rect = Rectangle(
-                (col * patch_w, row * patch_h),
-                patch_w,
-                patch_h,
-                fill=False,
-                edgecolor="red",
-                linewidth=2,
-            )
-            axes[2].add_patch(rect)
-            axes[2].text(
-                col * patch_w + 2,
-                row * patch_h + 14,
-                str(rank_idx),
-                color="white",
-                fontsize=10,
-                bbox=dict(facecolor="red", edgecolor="red", pad=1.0),
-            )
-        axes[2].set_title("(c) Patch Reordering (Top-10)")
-        axes[2].axis("off")
+            # (c) Attention-Guided Reorder (Top-10) - red boxes
+            axes[2].imshow(img_np)
+            indices = sample["indices"]
+            topk = min(10, indices.numel())
+            for rank_idx, patch_idx in enumerate(indices[:topk].tolist(), start=1):
+                row = patch_idx // w_tokens
+                col = patch_idx % w_tokens
+                rect = Rectangle(
+                    (col * patch_w, row * patch_h), patch_w, patch_h,
+                    fill=False, edgecolor="red", linewidth=2,
+                )
+                axes[2].add_patch(rect)
+                axes[2].text(
+                    col * patch_w + 2, row * patch_h + 14, str(rank_idx),
+                    color="white", fontsize=10,
+                    bbox=dict(facecolor="red", edgecolor="red", pad=1.0),
+                )
+            axes[2].set_title("(c) Attention Reorder (Top-10)")
+            axes[2].axis("off")
 
-        axes[3].imshow(img_np)
-        axes[3].imshow(attn_map, cmap="jet", alpha=0.45)
-        axes[3].set_title("(d) BiMamba Final Attention")
-        axes[3].axis("off")
+            # (d) Attention Heatmap
+            axes[3].imshow(img_np)
+            sim_map = sample["sim"].view(1, 1, h_tokens, w_tokens)
+            sim_map = F.interpolate(sim_map, size=(img_h, img_w), mode="bilinear", align_corners=False)
+            sim_map = sim_map.squeeze().numpy()
+            axes[3].imshow(sim_map, cmap="jet", alpha=0.45)
+            axes[3].set_title("(d) CLS Attention Heatmap")
+            axes[3].axis("off")
+
+            # (e) BiMamba Final Attention
+            axes[4].imshow(img_np)
+            attn_map = sample["restored_attn"].view(1, 1, h_tokens, w_tokens)
+            attn_map = F.interpolate(attn_map, size=(img_h, img_w), mode="bilinear", align_corners=False)
+            attn_map = attn_map.squeeze().numpy()
+            axes[4].imshow(attn_map, cmap="jet", alpha=0.45)
+            axes[4].set_title("(e) BiMamba Final Attention")
+            axes[4].axis("off")
+        else:
+            # Legacy fallback: similarity-based visualization only
+            sim_map = sample["sim"].view(1, 1, h_tokens, w_tokens)
+            sim_map = F.interpolate(sim_map, size=(img_h, img_w), mode="bilinear", align_corners=False)
+            sim_map = sim_map.squeeze().numpy()
+
+            axes[1].imshow(img_np)
+            axes[1].imshow(sim_map, cmap="jet", alpha=0.45)
+            axes[1].set_title("(b) CLIP Initial Similarity")
+            axes[1].axis("off")
+
+            axes[2].imshow(img_np)
+            indices = sample["indices"]
+            topk = min(10, indices.numel())
+            for rank_idx, patch_idx in enumerate(indices[:topk].tolist(), start=1):
+                row = patch_idx // w_tokens
+                col = patch_idx % w_tokens
+                rect = Rectangle(
+                    (col * patch_w, row * patch_h), patch_w, patch_h,
+                    fill=False, edgecolor="red", linewidth=2,
+                )
+                axes[2].add_patch(rect)
+                axes[2].text(
+                    col * patch_w + 2, row * patch_h + 14, str(rank_idx),
+                    color="white", fontsize=10,
+                    bbox=dict(facecolor="red", edgecolor="red", pad=1.0),
+                )
+            axes[2].set_title("(c) Patch Reordering (Top-10)")
+            axes[2].axis("off")
+
+            axes[3].imshow(img_np)
+            attn_map = sample["restored_attn"].view(1, 1, h_tokens, w_tokens)
+            attn_map = F.interpolate(attn_map, size=(img_h, img_w), mode="bilinear", align_corners=False)
+            attn_map = attn_map.squeeze().numpy()
+            axes[3].imshow(attn_map, cmap="jet", alpha=0.45)
+            axes[3].set_title("(d) BiMamba Final Attention")
+            axes[3].axis("off")
 
         plt.tight_layout(pad=0.6, w_pad=0.4)
         save_name = _build_visual_filename(sample, image_key, file_prefix=file_prefix)
@@ -528,15 +591,23 @@ def train_climb(cfg,
                             sim = visual_tensors["sim"].detach().cpu()
                             indices = visual_tensors["indices"].detach().cpu().long()
                             attn_weights = visual_tensors["attn_weights"].detach().cpu()
+                            sim_raw = visual_tensors.get("sim_raw")
+                            indices_raw = visual_tensors.get("indices_raw")
+                            if sim_raw is not None:
+                                sim_raw = sim_raw.detach().cpu()
+                            if indices_raw is not None:
+                                indices_raw = indices_raw.detach().cpu().long()
                             batch_size = img_cpu.size(0)
                             if sim.dim() == 3:
                                 sim = sim.squeeze(1)
+                            if sim_raw is not None and sim_raw.dim() == 3:
+                                sim_raw = sim_raw.squeeze(1)
                             restored_attn = _resolve_attention_map(attn_weights, indices, batch_size, logger=logger, tag=f"epoch{epoch}")
 
                             for sample_idx, image_key in enumerate(batch_keys):
                                 if image_key not in selected_targets or image_key in epoch_visuals:
                                     continue
-                                epoch_visuals[image_key] = {
+                                vis_entry = {
                                     "img": img_cpu[sample_idx].clone(),
                                     "sim": sim[sample_idx].clone(),
                                     "indices": indices[sample_idx].clone(),
@@ -547,6 +618,11 @@ def train_climb(cfg,
                                     "image_key": image_key,
                                     "reason": selected_targets[image_key]["reason"],
                                 }
+                                if sim_raw is not None:
+                                    vis_entry["sim_raw"] = sim_raw[sample_idx].clone()
+                                if indices_raw is not None:
+                                    vis_entry["indices_raw"] = indices_raw[sample_idx].clone()
+                                epoch_visuals[image_key] = vis_entry
 
                             if len(epoch_visuals) == len(selected_targets):
                                 break
@@ -655,10 +731,18 @@ def do_inference(cfg,
             sim = visual_tensors["sim"].detach().cpu()
             indices = visual_tensors["indices"].detach().cpu().long()
             attn_weights = visual_tensors["attn_weights"].detach().cpu()
+            sim_raw = visual_tensors.get("sim_raw")
+            indices_raw = visual_tensors.get("indices_raw")
+            if sim_raw is not None:
+                sim_raw = sim_raw.detach().cpu()
+            if indices_raw is not None:
+                indices_raw = indices_raw.detach().cpu().long()
 
             batch_size = img_cpu.size(0)
             if sim.dim() == 3:
                 sim = sim.squeeze(1)
+            if sim_raw is not None and sim_raw.dim() == 3:
+                sim_raw = sim_raw.squeeze(1)
             restored_attn = _resolve_attention_map(attn_weights, indices, batch_size, logger=logger, tag="inference")
 
             for sample_idx in range(batch_size):
@@ -666,7 +750,7 @@ def do_inference(cfg,
                 image_key = img_paths[sample_idx] if img_paths is not None else f"sample_{original_index:05d}"
                 pid_value = int(np.asarray(pid)[sample_idx])
                 camid_value = int(np.asarray(camid)[sample_idx])
-                inference_visuals[image_key] = {
+                vis_entry = {
                     "img": img_cpu[sample_idx].clone(),
                     "sim": sim[sample_idx].clone(),
                     "indices": indices[sample_idx].clone(),
@@ -675,6 +759,11 @@ def do_inference(cfg,
                     "camid": camid_value,
                     "image_key": image_key,
                 }
+                if sim_raw is not None:
+                    vis_entry["sim_raw"] = sim_raw[sample_idx].clone()
+                if indices_raw is not None:
+                    vis_entry["indices_raw"] = indices_raw[sample_idx].clone()
+                inference_visuals[image_key] = vis_entry
             global_offset += batch_size
 
     h_tokens = model.module.h_resolution if hasattr(model, "module") else model.h_resolution
@@ -699,8 +788,17 @@ def do_inference(cfg,
 
     cmc, mAP, cmc01, mAP01, cmc02, mAP02, cmc03, mAP03 = evaluator.compute()
     logger.info("Validation Results ")
-    logger.info("mAP: {:.5%}".format(mAP))
-
-    for r in [1, 5, 10]:
+    logger.info("mAP(main): {:.5%}".format(mAP))
+    for r in [1, 5, 10, 20]:
         logger.info("CMC curve, Rank-{:<3}:{:.5%}".format(r, cmc[r - 1]))
+
+    logger.info("mAP_1(CLIP): {:.5%}".format(mAP01))
+    for r in [1, 5, 10, 20]:
+        logger.info("CMC curve, Rank-{:<3}:{:.5%}".format(r, cmc01[r - 1]))
+    logger.info("mAP_2(BiMamba): {:.5%}".format(mAP02))
+    for r in [1, 5, 10, 20]:
+        logger.info("CMC curve, Rank-{:<3}:{:.5%}".format(r, cmc02[r - 1]))
+    logger.info("mAP_3: {:.5%}".format(mAP03))
+    for r in [1, 5, 10, 20]:
+        logger.info("CMC curve, Rank-{:<3}:{:.5%}".format(r, cmc03[r - 1]))
     return cmc[0], cmc[4]

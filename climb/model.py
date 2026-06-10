@@ -134,27 +134,69 @@ class CLIMB(nn.Module):
             nn.Tanh(),
             nn.Linear(192, 1)
         )
+        self.use_attention_reorder = getattr(cfg.MODEL, 'USE_ATTENTION_REORDER', False)
+        self.mamba_top_k = getattr(cfg.MODEL, 'MAMBA_TOP_K', 128)
+        if self.use_attention_reorder:
+            print('Using attention-guided reordering for Mamba branch')
+        print('Mamba top-k patches: {}'.format(self.mamba_top_k))
 
-    def reorder(self, reference, raw, return_debug=False):
+    def reorder(self, reference, raw, return_debug=False, top_k=None):
+        if top_k is None:
+            top_k = raw.size(1)
 
-        # attention_map = attention_map.mean(axis=1)  # torch.Size([64, 50, 50])
         reference_norm = F.normalize(reference, dim=-1).unsqueeze(1)  # bt, 1, 768
-        raw_norm = F.normalize(raw, dim=-1)  # bt, 128, 768
-        raw_norm = torch.transpose(raw_norm, 1, 2) # bt, 768, 128
-        sim = torch.bmm(reference_norm, raw_norm).squeeze(1)  # [bt, 1, 768] [bt, 768, 128]= [bt, 1, 128]
+        raw_norm = F.normalize(raw, dim=-1)  # bt, N, 768
+        raw_norm = torch.transpose(raw_norm, 1, 2) # bt, 768, N
+        sim = torch.bmm(reference_norm, raw_norm).squeeze(1)  # [bt, 1, 768] [bt, 768, N]= [bt, N]
 
         _, indices = torch.sort(sim, descending=True)
 
+        # Only keep top-k tokens
+        if top_k < indices.size(1):
+            indices = indices[:, :top_k]
+
         selected_patch_embedding = []
-        for i in range(indices.size(0)):   #bs
-          all_patch_embeddings_i = raw[i, :,:].squeeze()  # torch.Size([128, 768])
-          top_k_embedding = torch.index_select(all_patch_embeddings_i, 0, indices[i])  # torch.Size([128, 768])
-          top_k_embedding = top_k_embedding.unsqueeze(0)  # torch.Size([1, 128, 768])
-          selected_patch_embedding.append(top_k_embedding)
-        selected_patch_embedding = torch.cat(selected_patch_embedding, 0)  # torch.Size([64, 128, 768])
+        for i in range(indices.size(0)):
+            all_patch_embeddings_i = raw[i, :, :].squeeze()
+            top_k_embedding = torch.index_select(all_patch_embeddings_i, 0, indices[i])
+            top_k_embedding = top_k_embedding.unsqueeze(0)
+            selected_patch_embedding.append(top_k_embedding)
+        selected_patch_embedding = torch.cat(selected_patch_embedding, 0)
 
         if return_debug:
             return selected_patch_embedding, sim, indices
+        return selected_patch_embedding
+
+    def reorder_by_attention(self, attn_weights, raw, return_debug=False, top_k=None):
+        """
+        Reorder patch tokens using CLS->patches attention weights from CLIP ViT last layer.
+        Args:
+            attn_weights: (B, 129, 129) attention matrix from last MHA layer
+            raw: (B, N, 768) patch token embeddings
+            top_k: number of top tokens to keep (default all)
+        Returns:
+            selected_patch_embedding: (B, top_k, 768) reordered patches
+        """
+        # Extract CLS token (index 0) attention to all patch tokens (index 1:)
+        cls_attn = attn_weights[:, 0, 1:]  # (B, N)
+        # Normalize with softmax for stability
+        cls_attn = F.softmax(cls_attn, dim=-1)
+        _, indices = torch.sort(cls_attn, descending=True)
+
+        # Only keep top-k tokens
+        if top_k is not None and top_k < indices.size(1):
+            indices = indices[:, :top_k]
+
+        selected_patch_embedding = []
+        for i in range(indices.size(0)):
+            all_patch_embeddings_i = raw[i, :, :].squeeze()
+            top_k_embedding = torch.index_select(all_patch_embeddings_i, 0, indices[i])
+            top_k_embedding = top_k_embedding.unsqueeze(0)
+            selected_patch_embedding.append(top_k_embedding)
+        selected_patch_embedding = torch.cat(selected_patch_embedding, 0)
+
+        if return_debug:
+            return selected_patch_embedding, cls_attn, indices
         return selected_patch_embedding
 
     def forward(self, x, get_image = False, cam_label= None, view_label=None, return_visuals=False):
@@ -167,7 +209,7 @@ class CLIMB(nn.Module):
                 cv_embed = self.sie_coe * self.cv_embed[view_label]
             else:
                 cv_embed = None
-            _, image_features, image_features_proj, = self.image_encoder(x, cv_embed)
+            _, image_features, image_features_proj = self.image_encoder(x, cv_embed)
             img_feature = image_features[:,0]
             img_feature_proj = image_features_proj[:,0]
 
@@ -185,7 +227,17 @@ class CLIMB(nn.Module):
             cv_embed = self.sie_coe * self.cv_embed[view_label]
         else:
             cv_embed = None
-        _, image_features, image_features_proj, = self.image_encoder(x, cv_embed)
+
+        collect_visuals = return_visuals and not self.training
+        need_attn = self.use_attention_reorder or collect_visuals
+
+        if need_attn:
+            encoder_out = self.image_encoder(x, cv_embed, return_attn=True)
+            image_features, image_features_proj, attn_weights = encoder_out[1], encoder_out[2], encoder_out[3]
+        else:
+            _, image_features, image_features_proj = self.image_encoder(x, cv_embed)
+            attn_weights = None
+
         img_feature = image_features[:, 0]
         img_feature_proj = image_features_proj[:, 0]
 
@@ -195,35 +247,48 @@ class CLIMB(nn.Module):
         out_feat = torch.cat([feat, feat_proj], dim=1)
 
         feats_for_mamba = image_features.detach()  # torch.Size([64, 129, 768])
-        # BT, hw, D => BT, D, hw => B, T, D, hw => B, D, T, hw => B, D, T, h, w
-        # feats_for_mamba = feats_for_mamba.permute(0, 2, 1)  # torch.Size([64, 768, 128])
         feats_for_mamba_sp = feats_for_mamba[:, 1:, :].detach()
         feats_for_mamba_cls = feats_for_mamba[:, 0, :].detach()  # torch.Size([64, 768])
         #### reorder
-        collect_visuals = return_visuals and not self.training
+
+        reorder_sim, reorder_indices = None, None
+        reorder_sim_raw, reorder_indices_raw = None, None
 
         if collect_visuals:
-            re_order_mamba_sp, reorder_sim, reorder_indices = self.reorder(
-                feats_for_mamba_cls, feats_for_mamba_sp, return_debug=True
+            # Always compute original similarity reorder for visualization comparison
+            re_order_sim, sim_raw, indices_sim = self.reorder(
+                feats_for_mamba_cls, feats_for_mamba_sp, return_debug=True, top_k=self.mamba_top_k
             )
+            # Compute attention-based reorder
+            if attn_weights is not None:
+                re_order_attn, attn_scores, indices_attn = self.reorder_by_attention(
+                    attn_weights, feats_for_mamba_sp, return_debug=True, top_k=self.mamba_top_k
+                )
+            else:
+                re_order_attn, attn_scores, indices_attn = re_order_sim, sim_raw, indices_sim
+
+            # Use attention reorder for actual Mamba input
+            re_order_mamba_sp = re_order_attn
+            reorder_sim = attn_scores
+            reorder_indices = indices_attn
+            reorder_sim_raw = sim_raw
+            reorder_indices_raw = indices_sim
+        elif self.use_attention_reorder and attn_weights is not None:
+            # Training / inference with attention reorder
+            re_order_mamba_sp = self.reorder_by_attention(attn_weights, feats_for_mamba_sp, top_k=self.mamba_top_k)
         else:
-            re_order_mamba_sp = self.reorder(feats_for_mamba_cls, feats_for_mamba_sp)
-            reorder_sim, reorder_indices = None, None
+            # Original similarity reorder
+            re_order_mamba_sp = self.reorder(feats_for_mamba_cls, feats_for_mamba_sp, top_k=self.mamba_top_k)
 
         B, num_token, D = re_order_mamba_sp.shape
-        # re_order_mamba_sp = re_order_mamba_sp.reshape(BT, self.h_resolution, self.w_resolution,
-        #                                              D)  # torch.Size([64, 16, 8, 768])
-        # mamba_sp_out = self.sp_mamba_raw(re_order_mamba_sp)  # torch.Size([64, 128, 768])
-        mamba_sp_out = self.sp_mamba_bi(re_order_mamba_sp)  # torch.Size([64, 16, 8, 768])
-        # mamba_sp_out = mamba_sp_out.reshape(B, self.h_resolution * self.w_resolution, D).contiguous()
-        mamba_sp_out = torch.cat((feats_for_mamba_cls.unsqueeze(1), mamba_sp_out), dim=1)  # torch.Size([64, 129, 768])
-        # mamba_sp_out = mamba_sp_out.mean(1)  # torch.Size([64, 768])
-        mamba_sp_out2 = self.norm2_mamba(mamba_sp_out)  # bt, 128, 768
-        A = self.sp_attention(mamba_sp_out2)  # [B, n, K]  # torch.Size([8, 1024, 1])
-        A = torch.transpose(A, 1, 2)  # torch.Size([8, 1, 1024])
-        A = F.softmax(A, dim=-1)  # [B, K, n]  # torch.Size([8, 1, 1024])
-        mamba_sp_out2 = torch.bmm(A, mamba_sp_out2)  # [B, K, 512]  torch.Size([8, 1, 512])
-        mamba_sp_out2 = mamba_sp_out2.squeeze(1)  # torch.Size([64, 768])
+        mamba_sp_out = self.sp_mamba_bi(re_order_mamba_sp)
+        mamba_sp_out = torch.cat((feats_for_mamba_cls.unsqueeze(1), mamba_sp_out), dim=1)
+        mamba_sp_out2 = self.norm2_mamba(mamba_sp_out)
+        A = self.sp_attention(mamba_sp_out2)
+        A = torch.transpose(A, 1, 2)
+        A = F.softmax(A, dim=-1)
+        mamba_sp_out2 = torch.bmm(A, mamba_sp_out2)
+        mamba_sp_out2 = mamba_sp_out2.squeeze(1)
         feat_sp = self.bottleneck_proj_sp(mamba_sp_out2)
 
         if self.training:
@@ -236,6 +301,8 @@ class CLIMB(nn.Module):
                 visual_tensors = {
                     "sim": reorder_sim,
                     "indices": reorder_indices,
+                    "sim_raw": reorder_sim_raw,
+                    "indices_raw": reorder_indices_raw,
                     "attn_weights": A,
                 }
                 return feat_concat, out_feat, feat_sp, visual_tensors

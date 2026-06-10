@@ -176,11 +176,19 @@ class ResidualAttentionBlock(nn.Module):
         self.ln_2 = LayerNorm(d_model)
         self.attn_mask = attn_mask
 
-    def attention(self, x: torch.Tensor):
+    def attention(self, x: torch.Tensor, need_weights=False):
         self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
-        return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
+        attn_output, attn_weights = self.attn(x, x, x, need_weights=need_weights, attn_mask=self.attn_mask)
+        if need_weights:
+            return attn_output, attn_weights
+        return attn_output
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, need_weights=False):
+        if need_weights:
+            attn_output, attn_weights = self.attention(self.ln_1(x), need_weights=True)
+            x = x + attn_output
+            x = x + self.mlp(self.ln_2(x))
+            return x, attn_weights
         x = x + self.attention(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
@@ -215,28 +223,33 @@ class VisionTransformer(nn.Module):
         self.ln_post = LayerNorm(width)
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
 
-    def forward(self, x: torch.Tensor, cv_emb = None):
+    def forward(self, x: torch.Tensor, cv_emb = None, return_attn=False):
         x = self.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
         x = x.permute(0, 2, 1)
         x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)  # shape = [*, grid ** 2 + 1, width]
-        if cv_emb != None: 
+        if cv_emb != None:
             x[:,0] = x[:,0] + cv_emb
         x = x + self.positional_embedding.to(x.dtype)
         x = self.ln_pre(x)
-        
-        x = x.permute(1, 0, 2)  # NLD -> LND
-        
-        x11 = self.transformer.resblocks[:11](x) 
-        x12 = self.transformer.resblocks[11](x11) 
-        x11 = x11.permute(1, 0, 2)  # LND -> NLD  
-        x12 = x12.permute(1, 0, 2)  # LND -> NLD  
 
-        x12 = self.ln_post(x12)  
+        x = x.permute(1, 0, 2)  # NLD -> LND
+
+        x11 = self.transformer.resblocks[:11](x)
+        if return_attn:
+            x12, attn_weights = self.transformer.resblocks[11](x11, need_weights=True)
+        else:
+            x12 = self.transformer.resblocks[11](x11)
+        x11 = x11.permute(1, 0, 2)  # LND -> NLD
+        x12 = x12.permute(1, 0, 2)  # LND -> NLD
+
+        x12 = self.ln_post(x12)
 
         if self.proj is not None:
-            xproj = x12 @ self.proj   
+            xproj = x12 @ self.proj
 
+        if return_attn:
+            return x11, x12, xproj, attn_weights
         return x11, x12, xproj
 
 
