@@ -136,8 +136,17 @@ class CLIMB(nn.Module):
         )
         self.use_attention_reorder = getattr(cfg.MODEL, 'USE_ATTENTION_REORDER', False)
         self.mamba_top_k = getattr(cfg.MODEL, 'MAMBA_TOP_K', 128)
+        self.attention_reorder_soft_gate = getattr(cfg.MODEL, 'ATTENTION_REORDER_SOFT_GATE', False)
+        self.attention_gate_temperature = getattr(cfg.MODEL, 'ATTENTION_GATE_TEMPERATURE', 0.1)
+        self.attention_gate_center = getattr(cfg.MODEL, 'ATTENTION_GATE_CENTER', 0.5)
         if self.use_attention_reorder:
             print('Using attention-guided reordering for Mamba branch')
+            if self.attention_reorder_soft_gate:
+                print(
+                    'Using soft-gated residual attention reorder: temperature={}, center={}'.format(
+                        self.attention_gate_temperature, self.attention_gate_center
+                    )
+                )
         print('Mamba top-k patches: {}'.format(self.mamba_top_k))
 
     def reorder(self, reference, raw, return_debug=False, top_k=None):
@@ -170,6 +179,8 @@ class CLIMB(nn.Module):
     def reorder_by_attention(self, attn_weights, raw, return_debug=False, top_k=None):
         """
         Reorder patch tokens using CLS->patches attention weights from CLIP ViT last layer.
+        When soft gate is enabled, the sorted tokens are blended with their original-order
+        counterparts to avoid fully discarding spatial order and low-attention identity cues.
         Args:
             attn_weights: (B, 129, 129) attention matrix from last MHA layer
             raw: (B, N, 768) patch token embeddings
@@ -187,13 +198,17 @@ class CLIMB(nn.Module):
         if top_k is not None and top_k < indices.size(1):
             indices = indices[:, :top_k]
 
-        selected_patch_embedding = []
-        for i in range(indices.size(0)):
-            all_patch_embeddings_i = raw[i, :, :].squeeze()
-            top_k_embedding = torch.index_select(all_patch_embeddings_i, 0, indices[i])
-            top_k_embedding = top_k_embedding.unsqueeze(0)
-            selected_patch_embedding.append(top_k_embedding)
-        selected_patch_embedding = torch.cat(selected_patch_embedding, 0)
+        selected_patch_embedding = torch.gather(raw, 1, indices.unsqueeze(-1).expand(-1, -1, raw.size(-1)))
+        if self.attention_reorder_soft_gate:
+            original_patch_embedding = raw[:, :indices.size(1), :]
+            selected_attn = torch.gather(cls_attn, 1, indices)
+            attn_min = selected_attn.min(dim=1, keepdim=True)[0]
+            attn_max = selected_attn.max(dim=1, keepdim=True)[0]
+            selected_attn = (selected_attn - attn_min) / (attn_max - attn_min + 1e-6)
+            gate = torch.sigmoid(
+                (selected_attn - self.attention_gate_center) / max(self.attention_gate_temperature, 1e-6)
+            ).unsqueeze(-1)
+            selected_patch_embedding = gate * selected_patch_embedding + (1.0 - gate) * original_patch_embedding
 
         if return_debug:
             return selected_patch_embedding, cls_attn, indices
