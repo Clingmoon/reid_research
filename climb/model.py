@@ -55,6 +55,55 @@ def load_clip_to_cpu(backbone_name, h_resolution, w_resolution, vision_stride_si
 
     return model
 
+
+class LocalCLIPAggregator(nn.Module):
+    def __init__(self, d_model=768, num_stripes=4):
+        super(LocalCLIPAggregator, self).__init__()
+        self.num_stripes = num_stripes
+        self.token_attention = nn.Sequential(
+            nn.Linear(d_model, d_model // 4),
+            nn.Tanh(),
+            nn.Linear(d_model // 4, 1)
+        )
+        self.stripe_attention = nn.Sequential(
+            nn.Linear(d_model, d_model // 4),
+            nn.Tanh(),
+            nn.Linear(d_model // 4, 1)
+        )
+
+    def forward(self, patch_tokens, h_resolution, w_resolution, visibility=None):
+        B, N, D = patch_tokens.shape
+        if N != h_resolution * w_resolution:
+            token_logits = self.token_attention(patch_tokens).squeeze(-1)
+            if visibility is not None:
+                token_logits = token_logits + torch.log(visibility.clamp_min(1e-6))
+            token_weights = F.softmax(token_logits, dim=-1).unsqueeze(1)
+            return torch.bmm(token_weights, patch_tokens).squeeze(1)
+
+        patch_grid = patch_tokens.view(B, h_resolution, w_resolution, D)
+        visibility_grid = None
+        if visibility is not None:
+            visibility_grid = visibility.view(B, h_resolution, w_resolution)
+
+        stripe_features = []
+        stripe_count = min(self.num_stripes, h_resolution)
+        for stripe_idx in range(stripe_count):
+            start = stripe_idx * h_resolution // stripe_count
+            end = (stripe_idx + 1) * h_resolution // stripe_count
+            stripe_tokens = patch_grid[:, start:end, :, :].reshape(B, -1, D)
+            stripe_logits = self.token_attention(stripe_tokens).squeeze(-1)
+            if visibility_grid is not None:
+                stripe_visibility = visibility_grid[:, start:end, :].reshape(B, -1)
+                stripe_logits = stripe_logits + torch.log(stripe_visibility.clamp_min(1e-6))
+            stripe_weights = F.softmax(stripe_logits, dim=-1).unsqueeze(1)
+            stripe_features.append(torch.bmm(stripe_weights, stripe_tokens).squeeze(1))
+
+        stripe_features = torch.stack(stripe_features, dim=1)
+        stripe_logits = self.stripe_attention(stripe_features).squeeze(-1)
+        stripe_weights = F.softmax(stripe_logits, dim=-1).unsqueeze(1)
+        return torch.bmm(stripe_weights, stripe_features).squeeze(1)
+
+
 class CLIMB(nn.Module):
     def __init__(self, num_classes, camera_num, view_num, cfg):
         super(CLIMB, self).__init__()
@@ -139,6 +188,31 @@ class CLIMB(nn.Module):
         self.attention_reorder_soft_gate = getattr(cfg.MODEL, 'ATTENTION_REORDER_SOFT_GATE', False)
         self.attention_gate_temperature = getattr(cfg.MODEL, 'ATTENTION_GATE_TEMPERATURE', 0.1)
         self.attention_gate_center = getattr(cfg.MODEL, 'ATTENTION_GATE_CENTER', 0.5)
+        self.use_local_clip_aggregation = getattr(cfg.MODEL, 'USE_LOCAL_CLIP_AGG', False)
+        self.local_clip_fusion_alpha = getattr(cfg.MODEL, 'LOCAL_CLIP_FUSION_ALPHA', 0.5)
+        self.local_clip_use_visibility = getattr(cfg.MODEL, 'LOCAL_CLIP_USE_VISIBILITY', True)
+        self.use_visibility_weighting = getattr(cfg.MODEL, 'USE_VISIBILITY_WEIGHTING', False)
+        self.visibility_temperature = getattr(cfg.MODEL, 'VISIBILITY_TEMPERATURE', 0.2)
+        self.visibility_center = getattr(cfg.MODEL, 'VISIBILITY_CENTER', 0.5)
+        if self.use_local_clip_aggregation:
+            self.local_clip_aggregator = LocalCLIPAggregator(
+                d_model=768,
+                num_stripes=getattr(cfg.MODEL, 'LOCAL_CLIP_NUM_STRIPES', 4)
+            )
+            self.local_clip_aggregator.apply(weights_init_kaiming)
+            print(
+                'Using local CLIP aggregation: stripes={}, alpha={}, visibility={}'.format(
+                    getattr(cfg.MODEL, 'LOCAL_CLIP_NUM_STRIPES', 4),
+                    self.local_clip_fusion_alpha,
+                    self.local_clip_use_visibility
+                )
+            )
+        if self.use_visibility_weighting:
+            print(
+                'Using visibility-weighted token aggregation: temperature={}, center={}'.format(
+                    self.visibility_temperature, self.visibility_center
+                )
+            )
         if self.use_attention_reorder:
             print('Using attention-guided reordering for Mamba branch')
             if self.attention_reorder_soft_gate:
@@ -148,6 +222,48 @@ class CLIMB(nn.Module):
                     )
                 )
         print('Mamba top-k patches: {}'.format(self.mamba_top_k))
+
+    def compute_visibility(self, cls_token, patch_tokens, attn_weights=None):
+        if attn_weights is not None:
+            visibility = attn_weights[:, 0, 1:]
+            visibility = F.softmax(visibility, dim=-1)
+        else:
+            cls_norm = F.normalize(cls_token, dim=-1).unsqueeze(1)
+            patch_norm = F.normalize(patch_tokens, dim=-1)
+            visibility = torch.bmm(cls_norm, patch_norm.transpose(1, 2)).squeeze(1)
+
+        visibility_min = visibility.min(dim=1, keepdim=True)[0]
+        visibility_max = visibility.max(dim=1, keepdim=True)[0]
+        visibility = (visibility - visibility_min) / (visibility_max - visibility_min + 1e-6)
+        visibility = torch.sigmoid(
+            (visibility - self.visibility_center) / max(self.visibility_temperature, 1e-6)
+        )
+        return visibility
+
+    def aggregate_mamba_tokens(self, mamba_tokens, visibility=None, return_weights=False):
+        attention_logits = self.sp_attention(mamba_tokens).transpose(1, 2)
+        if self.use_visibility_weighting and visibility is not None:
+            visibility = visibility.detach()
+            cls_visibility = torch.ones(visibility.size(0), 1, device=visibility.device, dtype=visibility.dtype)
+            visibility = torch.cat((cls_visibility, visibility), dim=1).unsqueeze(1)
+            attention_logits = attention_logits + torch.log(visibility.clamp_min(1e-6))
+        attention_weights = F.softmax(attention_logits, dim=-1)
+        mamba_feature = torch.bmm(attention_weights, mamba_tokens).squeeze(1)
+        if return_weights:
+            return mamba_feature, attention_weights
+        return mamba_feature
+
+    def fuse_local_clip_feature(self, cls_token, patch_tokens, visibility=None):
+        if not self.use_local_clip_aggregation:
+            return cls_token
+        local_feature = self.local_clip_aggregator(
+            patch_tokens,
+            self.h_resolution,
+            self.w_resolution,
+            visibility if self.local_clip_use_visibility else None
+        )
+        alpha = min(max(self.local_clip_fusion_alpha, 0.0), 1.0)
+        return (1.0 - alpha) * cls_token + alpha * local_feature
 
     def reorder(self, reference, raw, return_debug=False, top_k=None):
         if top_k is None:
@@ -224,15 +340,22 @@ class CLIMB(nn.Module):
                 cv_embed = self.sie_coe * self.cv_embed[view_label]
             else:
                 cv_embed = None
-            need_attn = get_mamba and self.use_attention_reorder
+            need_attn = self.use_attention_reorder and (
+                get_mamba or self.use_local_clip_aggregation or self.use_visibility_weighting
+            )
             if need_attn:
                 encoder_out = self.image_encoder(x, cv_embed, return_attn=True)
                 image_features, image_features_proj, attn_weights = encoder_out[1], encoder_out[2], encoder_out[3]
             else:
                 _, image_features, image_features_proj = self.image_encoder(x, cv_embed)
                 attn_weights = None
+            patch_tokens = image_features[:, 1:, :]
             img_feature = image_features[:,0]
             img_feature_proj = image_features_proj[:,0]
+            visibility = None
+            if self.use_local_clip_aggregation or self.use_visibility_weighting:
+                visibility = self.compute_visibility(img_feature, patch_tokens, attn_weights)
+            img_feature = self.fuse_local_clip_feature(img_feature, patch_tokens, visibility)
 
             feat = self.bottleneck(img_feature)
             feat_proj = self.bottleneck_proj(img_feature_proj)
@@ -243,17 +366,26 @@ class CLIMB(nn.Module):
                 feats_for_mamba_sp = feats_for_mamba[:, 1:, :].detach()
                 feats_for_mamba_cls = feats_for_mamba[:, 0, :].detach()
                 if self.use_attention_reorder and attn_weights is not None:
-                    re_order_mamba_sp = self.reorder_by_attention(attn_weights, feats_for_mamba_sp, top_k=self.mamba_top_k)
+                    re_order_mamba_sp, _, reorder_indices_for_visibility = self.reorder_by_attention(
+                        attn_weights,
+                        feats_for_mamba_sp,
+                        return_debug=True,
+                        top_k=self.mamba_top_k
+                    )
                 else:
-                    re_order_mamba_sp = self.reorder(feats_for_mamba_cls, feats_for_mamba_sp, top_k=self.mamba_top_k)
+                    re_order_mamba_sp, _, reorder_indices_for_visibility = self.reorder(
+                        feats_for_mamba_cls,
+                        feats_for_mamba_sp,
+                        return_debug=True,
+                        top_k=self.mamba_top_k
+                    )
                 mamba_sp_out = self.sp_mamba_bi(re_order_mamba_sp)
                 mamba_sp_out = torch.cat((feats_for_mamba_cls.unsqueeze(1), mamba_sp_out), dim=1)
                 mamba_sp_out2 = self.norm2_mamba(mamba_sp_out)
-                A = self.sp_attention(mamba_sp_out2)
-                A = torch.transpose(A, 1, 2)
-                A = F.softmax(A, dim=-1)
-                mamba_sp_out2 = torch.bmm(A, mamba_sp_out2)
-                mamba_sp_out2 = mamba_sp_out2.squeeze(1)
+                mamba_visibility = None
+                if visibility is not None:
+                    mamba_visibility = torch.gather(visibility, 1, reorder_indices_for_visibility)
+                mamba_sp_out2 = self.aggregate_mamba_tokens(mamba_sp_out2, mamba_visibility)
                 feat_sp = self.bottleneck_proj_sp(mamba_sp_out2)
                 return out_feat, feat_sp
             return out_feat
@@ -277,8 +409,13 @@ class CLIMB(nn.Module):
             _, image_features, image_features_proj = self.image_encoder(x, cv_embed)
             attn_weights = None
 
+        patch_tokens = image_features[:, 1:, :]
         img_feature = image_features[:, 0]
         img_feature_proj = image_features_proj[:, 0]
+        visibility = None
+        if self.use_local_clip_aggregation or self.use_visibility_weighting:
+            visibility = self.compute_visibility(img_feature, patch_tokens, attn_weights)
+        img_feature = self.fuse_local_clip_feature(img_feature, patch_tokens, visibility)
 
         feat = self.bottleneck(img_feature)
         feat_proj = self.bottleneck_proj(img_feature_proj)
@@ -312,22 +449,32 @@ class CLIMB(nn.Module):
             reorder_indices = indices_attn
             reorder_sim_raw = sim_raw
             reorder_indices_raw = indices_sim
+            reorder_indices_for_visibility = indices_attn
         elif self.use_attention_reorder and attn_weights is not None:
             # Training / inference with attention reorder
-            re_order_mamba_sp = self.reorder_by_attention(attn_weights, feats_for_mamba_sp, top_k=self.mamba_top_k)
+            re_order_mamba_sp, _, reorder_indices_for_visibility = self.reorder_by_attention(
+                attn_weights,
+                feats_for_mamba_sp,
+                return_debug=True,
+                top_k=self.mamba_top_k
+            )
         else:
             # Original similarity reorder
-            re_order_mamba_sp = self.reorder(feats_for_mamba_cls, feats_for_mamba_sp, top_k=self.mamba_top_k)
+            re_order_mamba_sp, _, reorder_indices_for_visibility = self.reorder(
+                feats_for_mamba_cls,
+                feats_for_mamba_sp,
+                return_debug=True,
+                top_k=self.mamba_top_k
+            )
 
         B, num_token, D = re_order_mamba_sp.shape
         mamba_sp_out = self.sp_mamba_bi(re_order_mamba_sp)
         mamba_sp_out = torch.cat((feats_for_mamba_cls.unsqueeze(1), mamba_sp_out), dim=1)
         mamba_sp_out2 = self.norm2_mamba(mamba_sp_out)
-        A = self.sp_attention(mamba_sp_out2)
-        A = torch.transpose(A, 1, 2)
-        A = F.softmax(A, dim=-1)
-        mamba_sp_out2 = torch.bmm(A, mamba_sp_out2)
-        mamba_sp_out2 = mamba_sp_out2.squeeze(1)
+        mamba_visibility = None
+        if visibility is not None:
+            mamba_visibility = torch.gather(visibility, 1, reorder_indices_for_visibility)
+        mamba_sp_out2, A = self.aggregate_mamba_tokens(mamba_sp_out2, mamba_visibility, return_weights=True)
         feat_sp = self.bottleneck_proj_sp(mamba_sp_out2)
 
         if self.training:

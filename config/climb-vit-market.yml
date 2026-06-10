@@ -10,6 +10,13 @@ MODEL:
   ATTENTION_REORDER_SOFT_GATE: True  # Ablation A: attention排序token与原始顺序token做soft gate残差融合
   ATTENTION_GATE_TEMPERATURE: 0.1    # gate温度，越小越接近hard选择
   ATTENTION_GATE_CENTER: 0.5         # 归一化attention超过该值时更偏向reorder token
+  USE_LOCAL_CLIP_AGG: True           # 局部CLIP聚合：用水平stripe的patch特征补充CLS
+  LOCAL_CLIP_NUM_STRIPES: 4          # 将patch网格按高度划分的局部条带数
+  LOCAL_CLIP_FUSION_ALPHA: 0.5       # CLS与局部聚合特征融合比例
+  LOCAL_CLIP_USE_VISIBILITY: True    # 局部聚合时使用可见性分数重加权patch
+  USE_VISIBILITY_WEIGHTING: True     # Mamba最终token attention使用可见性分数重加权
+  VISIBILITY_TEMPERATURE: 0.2        # 可见性sigmoid温度
+  VISIBILITY_CENTER: 0.5             # 可见性sigmoid中心
   # SIE_CAMERA: True
   # SIE_COE : 1.0
 
