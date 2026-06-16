@@ -200,10 +200,27 @@ def _build_visualization_subset_loader(cfg, val_loader, logger):
 
 
 def _resolve_visualize_epochs(cfg):
+    if not cfg.TEST.VISUALIZE_COMPARISON:
+        return set()
     configured_epochs = list(getattr(cfg.TEST, 'VISUALIZE_EPOCHS', []))
     if configured_epochs:
         return {int(epoch) for epoch in configured_epochs}
     return {int(cfg.SOLVER.MAX_EPOCHS)}
+
+
+def _should_evaluate_epoch(cfg, epoch, eval_period, visualize_epochs):
+    eval_after_epoch = int(getattr(cfg.TEST, 'EVAL_AFTER_EPOCH', 60))
+    eval_until_epoch = int(getattr(cfg.TEST, 'EVAL_UNTIL_EPOCH', 70))
+    eval_every_after = int(getattr(cfg.TEST, 'EVAL_EVERY_AFTER', 0))
+    if epoch in visualize_epochs:
+        return True
+    if epoch < eval_after_epoch:
+        return False
+    if eval_until_epoch > 0 and epoch > eval_until_epoch:
+        return False
+    if eval_every_after > 0:
+        return (epoch - eval_after_epoch) % eval_every_after == 0
+    return eval_period > 0 and epoch % eval_period == 0
 
 
 def _unpack_eval_batch(batch):
@@ -525,7 +542,7 @@ def train_climb(cfg,
         scheduler.step()
         logger.info("Epoch {} done.".format(epoch))
 
-        should_eval = (epoch % eval_period == 0 and epoch >= 55) or (epoch in visualize_epochs)
+        should_eval = _should_evaluate_epoch(cfg, epoch, eval_period, visualize_epochs)
         if should_eval:
             model.eval()
             evaluator = R1_mAP_eval(

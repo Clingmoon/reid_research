@@ -4,17 +4,22 @@ MODEL:
   MEMORY_MOMENTUM: 0.2 # 记忆更新动量
   ID_LOSS_WEIGHT: 0.25
   PCL_LOSS_WEIGHT: 1.0 # 记忆对比损失
+  
   MAMBA_PCL_LOSS_WEIGHT: 0.1 # Ablation B: Mamba分支memory/prototype对比损失权重，0表示关闭
-  USE_ATTENTION_REORDER: True  # 使用CLIP最后一层attention指导patch重排序
+  
+  USE_ATTENTION_REORDER: True  # base 使用CLIP最后一层attention指导patch重排序
   MAMBA_TOP_K: 128            # 只取Top-K个patch进入Mamba（<=128）
-  ATTENTION_REORDER_SOFT_GATE: True  # Ablation A: attention排序token与原始顺序token做soft gate残差融合
+  
+  ATTENTION_REORDER_SOFT_GATE: False  # Ablation A: attention排序token与原始顺序token做soft gate残差融合
   ATTENTION_GATE_TEMPERATURE: 0.1    # gate温度，越小越接近hard选择
   ATTENTION_GATE_CENTER: 0.5         # 归一化attention超过该值时更偏向reorder token
-  USE_LOCAL_CLIP_AGG: True           # 局部CLIP聚合：用水平stripe的patch特征补充CLS
+  
+  USE_LOCAL_CLIP_AGG: False           # Ablation C: 局部CLIP聚合：用水平stripe的patch特征补充CLS
   LOCAL_CLIP_NUM_STRIPES: 4          # 将patch网格按高度划分的局部条带数
   LOCAL_CLIP_FUSION_ALPHA: 0.5       # CLS与局部聚合特征融合比例
-  LOCAL_CLIP_USE_VISIBILITY: True    # 局部聚合时使用可见性分数重加权patch
-  USE_VISIBILITY_WEIGHTING: True     # Mamba最终token attention使用可见性分数重加权
+  LOCAL_CLIP_USE_VISIBILITY: False    # 局部聚合时使用可见性分数重加权patch
+  
+  USE_VISIBILITY_WEIGHTING: False     # Mamba最终token attention使用可见性分数重加权
   VISIBILITY_TEMPERATURE: 0.2        # 可见性sigmoid温度
   VISIBILITY_CENTER: 0.5             # 可见性sigmoid中心
   # SIE_CAMERA: True
@@ -53,6 +58,9 @@ SOLVER:
   
 TEST:
   EVAL: True
+  EVAL_AFTER_EPOCH: 60 # 从第60轮开始允许评估
+  EVAL_UNTIL_EPOCH: 70 # 评估到第70轮；<=0表示不限制结束轮次
+  EVAL_EVERY_AFTER: 1  # 在评估窗口内每轮评估；0表示只按SOLVER.EVAL_PERIOD评估
   IMS_PER_BATCH: 256
   RE_RANKING: False
 
